@@ -381,6 +381,33 @@ func TestLogout(t *testing.T) {
 	}
 }
 
+func TestMe(t *testing.T) {
+	idp := newFakeIdP(t)
+	app, _ := newApp(t, idp, nil)
+	c := browser(t)
+	fetch := map[string]string{"Sec-Fetch-Mode": "same-origin"}
+
+	res, _ := get(t, noRedirect(browser(t)), app.URL+"/auth/me", fetch)
+	if res.StatusCode != 401 {
+		t.Errorf("signed out: got %d, want 401", res.StatusCode)
+	}
+
+	if _, body := get(t, c, app.URL+"/", nav); !strings.HasPrefix(body, "hello") {
+		t.Fatalf("login failed: %q", body)
+	}
+	res, body := get(t, c, app.URL+"/auth/me", fetch)
+	var me map[string]string
+	if err := json.Unmarshal([]byte(body), &me); err != nil || res.StatusCode != 200 {
+		t.Fatalf("signed in: %d %q (%v)", res.StatusCode, body, err)
+	}
+	if me["email"] != "a@example.com" || me["name"] != "Alice" || me["subject"] != "user-1" {
+		t.Errorf("unexpected user: %v", me)
+	}
+	if res.Header.Get("Cache-Control") != "no-store" {
+		t.Error("/auth/me must not be cached")
+	}
+}
+
 func TestSafeNext(t *testing.T) {
 	for in, want := range map[string]string{
 		"":                      "/",

@@ -11,9 +11,9 @@ if err != nil {
 handler = gate.Wrap(handler) // no-op when OIDC is not enabled
 ```
 
-`Wrap` adds `/auth/login`, `/auth/callback`, `/auth/logout` and
-`/auth/logged-out`, and requires a signed-in user for every other path.
-No front-end changes are needed:
+`Wrap` adds `/auth/login`, `/auth/callback`, `/auth/logout`,
+`/auth/logged-out` and `/auth/me`, and requires a signed-in user for every
+other path. No front-end changes are needed:
 
 - **Browser page loads** without a session are redirected to the IdP and
   returned to the page they asked for.
@@ -23,6 +23,17 @@ Handlers behind the gate can read the user:
 
 ```go
 if u, ok := oidcgate.UserFrom(r.Context()); ok { _ = u.Email }
+```
+
+### Showing a "Sign out" button only when OIDC is on
+
+`GET /auth/me` returns `{"subject","email","name"}` for a signed-in user and
+`401` otherwise. When OIDC is off the route doesn't exist, so your app
+answers `404`. A front end can therefore do:
+
+```js
+const res = await fetch('/auth/me');
+if (res.ok) account = await res.json(); // show "Signed in as …" + <a href="/auth/logout">
 ```
 
 ## Environment variables

@@ -5,8 +5,9 @@
 //	if err != nil { log.Fatal(err) }            // enabled but misconfigured
 //	handler = gate.Wrap(handler)                // no-op when OIDC is off
 //
-// Wrap adds /auth/login, /auth/callback, /auth/logout and /auth/logged-out,
-// and requires a signed-in user for every other path. Who may sign in is
+// Wrap adds /auth/login, /auth/callback, /auth/logout, /auth/logged-out and
+// /auth/me (the signed-in user as JSON, or 401), and requires a signed-in
+// user for every other path. Who may sign in is
 // decided at the IdP (e.g. Authelia access policy, Entra "assignment
 // required"); the gate only verifies that the IdP authenticated them.
 package oidcgate
@@ -16,6 +17,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -33,6 +35,7 @@ const (
 	callbackPath  = "/auth/callback"
 	logoutPath    = "/auth/logout"
 	loggedOutPath = "/auth/logged-out"
+	mePath        = "/auth/me"
 
 	flowTTL    = 10 * time.Minute
 	defaultTTL = 7 * 24 * time.Hour
@@ -145,6 +148,9 @@ func (g *Gate) Wrap(next http.Handler) http.Handler {
 			return
 		case loggedOutPath:
 			g.handleLoggedOut(w, r)
+			return
+		case mePath:
+			g.handleMe(w, r)
 			return
 		}
 		if g.isPublic(r.URL.Path) {
@@ -284,6 +290,21 @@ func (g *Gate) handleLogout(w http.ResponseWriter, r *http.Request) {
 	g.clearCookie(w, g.sessionCookie, "/")
 	w.Header().Set("Cache-Control", "no-store")
 	http.Redirect(w, r, loggedOutPath, http.StatusFound)
+}
+
+// handleMe lets a front end ask "is auth on, and who am I?": 200 with the
+// user as JSON, or 401. With the gate off the route doesn't exist, so the
+// app's own 404 tells the front end there is nothing to show (no logout
+// button, no account name).
+func (g *Gate) handleMe(w http.ResponseWriter, r *http.Request) {
+	u, ok := g.session(w, r)
+	if !ok {
+		g.deny(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(map[string]string{"subject": u.Subject, "email": u.Email, "name": u.Name})
 }
 
 // handleLoggedOut shows a landing page rather than bouncing straight back
