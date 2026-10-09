@@ -135,6 +135,11 @@ One local account, no password change; `BASE_URL` can't contain a path; each
 host needs its own IdP client; it answers "is this browser signed in?", nothing
 finer.
 
+Sessions are stateless cookies, so **logout clears this browser's cookie but
+can't revoke a copy of it**; a stolen cookie lives until it expires (7 days,
+sliding). To end every session, stop the app, delete `auth.json` (which also
+removes the account) and start it again.
+
 ## Testing
 
 - `make test-unit`: every flow in-process against a fake IdP.

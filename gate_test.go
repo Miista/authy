@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
@@ -933,6 +934,31 @@ func TestNewValidation(t *testing.T) {
 	}
 	if _, err := New(context.Background(), good()); err != nil {
 		t.Errorf("valid config rejected: %v", err)
+	}
+}
+
+// A public prefix must not be a way past the gate for a handler that cleans
+// paths itself: "/public/../secret" is gated, and the real public path is not.
+func TestPublicPrefixIsNotAnEscapeViaDotSegments(t *testing.T) {
+	// Like a bare http.FileServer: serves whatever the cleaned path names.
+	cleaning := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "served "+path.Clean(r.URL.Path))
+	})
+	g, err := New(context.Background(), Config{App: "my-app", DataDir: t.TempDir(), Logger: quiet, PublicPaths: []string{"/public/"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := httptest.NewServer(g.Wrap(cleaning))
+	t.Cleanup(app.Close)
+	c := noRedirect(browser())
+
+	if res, body := get(t, c, app.URL+"/public/file.txt", nil); res.StatusCode != 200 || body != "served /public/file.txt" {
+		t.Errorf("the real public path must stay public: %d %q", res.StatusCode, body)
+	}
+	for _, p := range []string{"/public/../secret", "/public/./../secret", "/public/%2e%2e/secret", "/public/.."} {
+		if res, body := get(t, c, app.URL+p, nil); res.StatusCode == 200 {
+			t.Errorf("%s reached the app: %d %q", p, res.StatusCode, body)
+		}
 	}
 }
 

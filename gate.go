@@ -238,8 +238,23 @@ func (g *Gate) Wrap(next http.Handler) http.Handler {
 }
 
 func (g *Gate) isPublic(path string) bool {
+	// A path with dot segments is never public. Some handlers (a bare
+	// http.FileServer) clean the path themselves, so "/public/../secret" would
+	// otherwise pass a "/public/" allowance here and be served as "/secret".
+	if hasDotSegment(path) {
+		return false
+	}
 	for _, p := range g.public {
 		if path == p || (strings.HasSuffix(p, "/") && strings.HasPrefix(path, p)) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasDotSegment(path string) bool {
+	for _, seg := range strings.Split(path, "/") {
+		if seg == "." || seg == ".." {
 			return true
 		}
 	}
