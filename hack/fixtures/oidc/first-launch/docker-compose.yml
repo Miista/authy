@@ -1,0 +1,35 @@
+# OIDC configured from the start, no local account.
+#
+# The gate sends a page load straight to the IdP and does not create a local
+# account; setup is closed, so nobody can claim the app by being first.
+#
+# Both services are reached by the names a browser on this network would use
+# (subject:8080, fakeidp:8080); the suite maps them to the published ports. The
+# issuer, the redirect URI and the base URL must agree with those names, which
+# is exactly what a real deployment has to get right.
+services:
+  fakeidp:
+    image: oidcgate-fakeidp:integration
+    pull_policy: never
+    ports:
+      - "127.0.0.1::8080"
+    environment:
+      ISSUER: "http://fakeidp:8080"
+      REDIRECT_URI: "http://subject:8080/auth/callback"
+
+  subject:
+    image: oidcgate-subject:integration
+    pull_policy: never
+    user: "${RUN_AS}"
+    depends_on:
+      - fakeidp
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      DEMO_OIDC_ENABLED: "true"
+      DEMO_OIDC_ISSUER: "http://fakeidp:8080"
+      DEMO_OIDC_CLIENT_ID: "cid"
+      DEMO_OIDC_CLIENT_SECRET: "csecret"
+      DEMO_OIDC_BASE_URL: "http://subject:8080"

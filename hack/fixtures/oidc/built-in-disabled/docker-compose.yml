@@ -1,0 +1,32 @@
+# OIDC is the only way in: DEMO_OIDC_DISABLE_BUILT_IN_LOGIN=true, with a local
+# account seeded as in with-account.
+#
+# The local form must be gone from the page AND refused by the server, so a
+# hidden form is not the only thing standing between a guesser and the account.
+services:
+  fakeidp:
+    image: oidcgate-fakeidp:integration
+    pull_policy: never
+    ports:
+      - "127.0.0.1::8080"
+    environment:
+      ISSUER: "http://fakeidp:8080"
+      REDIRECT_URI: "http://subject:8080/auth/callback"
+
+  subject:
+    image: oidcgate-subject:integration
+    pull_policy: never
+    user: "${RUN_AS}"
+    depends_on:
+      - fakeidp
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      DEMO_OIDC_ENABLED: "true"
+      DEMO_OIDC_ISSUER: "http://fakeidp:8080"
+      DEMO_OIDC_CLIENT_ID: "cid"
+      DEMO_OIDC_CLIENT_SECRET: "csecret"
+      DEMO_OIDC_BASE_URL: "http://subject:8080"
+      DEMO_OIDC_DISABLE_BUILT_IN_LOGIN: "true"

@@ -1,0 +1,16 @@
+# The data directory cannot be written -- the mistake that leaves a container
+# unable to keep an account, e.g. a volume owned by another user.
+#
+# Mounted read-only here so the failure is deterministic and needs no root on
+# the host. The app must refuse to start, with a message that points at the
+# directory, rather than start and lose the account at the first restart.
+services:
+  subject:
+    image: oidcgate-subject:integration
+    pull_policy: never
+    user: "${RUN_AS}"
+    restart: "no"
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - ./data:/app/data:ro

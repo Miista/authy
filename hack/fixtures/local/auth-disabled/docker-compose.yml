@@ -1,0 +1,17 @@
+# An app that deliberately relies on something else (forward auth at a proxy):
+# DEMO_AUTH_DISABLED=true turns the gate off entirely.
+#
+# Nothing is protected, the gate's routes do not exist (so /auth/client.js is a
+# 404 and a "Sign out" button hidden behind it stays hidden), and nothing is
+# written to the data directory.
+services:
+  subject:
+    image: oidcgate-subject:integration
+    pull_policy: never
+    user: "${RUN_AS}"
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      DEMO_AUTH_DISABLED: "true"

@@ -1,0 +1,19 @@
+# OIDC switched on with only half its settings.
+#
+# The app must refuse to start, and say which settings are missing, rather
+# than come up serving something unprotected. restart is "no" so the exit
+# stays visible to the test instead of looping.
+services:
+  subject:
+    image: oidcgate-subject:integration
+    pull_policy: never
+    user: "${RUN_AS}"
+    restart: "no"
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      DEMO_OIDC_ENABLED: "true"
+      DEMO_OIDC_ISSUER: "http://fakeidp:8080"
+      # CLIENT_ID, CLIENT_SECRET and BASE_URL deliberately missing.

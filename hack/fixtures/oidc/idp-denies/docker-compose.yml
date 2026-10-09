@@ -1,0 +1,32 @@
+# The IdP does not approve the login (FAKEIDP_DENY), and a local account exists
+# (seeded as in with-account).
+#
+# The user must land on the sign-in page with the local form and a retry
+# button, once, and not be bounced back to the IdP in a loop.
+services:
+  fakeidp:
+    image: oidcgate-fakeidp:integration
+    pull_policy: never
+    ports:
+      - "127.0.0.1::8080"
+    environment:
+      ISSUER: "http://fakeidp:8080"
+      REDIRECT_URI: "http://subject:8080/auth/callback"
+      FAKEIDP_DENY: "true"
+
+  subject:
+    image: oidcgate-subject:integration
+    pull_policy: never
+    user: "${RUN_AS}"
+    depends_on:
+      - fakeidp
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      DEMO_OIDC_ENABLED: "true"
+      DEMO_OIDC_ISSUER: "http://fakeidp:8080"
+      DEMO_OIDC_CLIENT_ID: "cid"
+      DEMO_OIDC_CLIENT_SECRET: "csecret"
+      DEMO_OIDC_BASE_URL: "http://subject:8080"

@@ -1,0 +1,15 @@
+# The gate on its own: no IdP, no OIDC settings, no account yet.
+#
+# The first visitor creates the account; every visit after that needs it. The
+# data directory is the app's usual /app/data volume, and the gate keeps its
+# state in /app/data/auth inside it. RUN_AS is written by the suite (whoever ran
+# it), so what the container writes is ours to read back and to delete.
+services:
+  subject:
+    image: oidcgate-subject:integration
+    pull_policy: never
+    user: "${RUN_AS}"
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - ./data:/app/data

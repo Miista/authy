@@ -1,1 +1,6 @@
 .DS_Store
+
+# Everything the integration suite builds: removed on cleanup, so it is only ever
+# here after a run that was killed. A prefix, so a testbed that does not exist
+# yet is covered too.
+/testbed*/

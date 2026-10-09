@@ -158,5 +158,19 @@ and call `oidcgate.New(ctx, cfg)`.
 
 ## Testing
 
-`go test -race ./...` runs every flow against an in-process fake IdP; nothing
-talks to a real provider.
+Two layers, both offline (nothing talks to a real provider):
+
+- `make test-unit` (`go test -race ./...`) runs every flow in-process against
+  a fake IdP. Fast; covers the logic.
+- `make test-integration` (needs docker) runs the gate as it ships: in a
+  container, as a non-root user, with a mounted data directory, next to a fake
+  IdP container on a real network. Each scenario is its own compose stack under
+  `hack/fixtures/<suite>/<scenario>/`: first launch and account creation,
+  persistence across a restart, the opt-out, refusing to start when
+  misconfigured or when the data directory is not writable, and every OIDC
+  branch (first launch, existing account, IdP denies, IdP down at startup,
+  built-in login disabled). The subject app and the fake IdP live under
+  `test/integration/` and are built from source into scratch images.
+
+`make scan` runs `go vet`, `gosec` and `govulncheck`; run it with the latest Go
+patch release before tagging.
