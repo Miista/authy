@@ -1,40 +1,55 @@
 # oidcgate
 
-OpenID Connect login for any `net/http` Go app, in two lines, configured
-entirely by environment variables.
+Login for any `net/http` Go app, in two lines, configured by environment
+variables: a local account created on first launch, plus optional OpenID
+Connect (Authelia, Authentik, Keycloak, Entra ID, …).
 
 ```go
-gate, err := oidcgate.FromEnv(ctx, "myapp") // reads MYAPP_OIDC_* env vars
+gate, err := oidcgate.FromEnv(ctx, "myapp") // reads MYAPP_* env vars
 if err != nil {
-	log.Fatal(err) // OIDC enabled but misconfigured: refuse to start
+	log.Fatal(err) // misconfigured: refuse to start rather than serve unprotected
 }
-handler = gate.Wrap(handler) // no-op when OIDC is not enabled
+handler = gate.Wrap(handler) // no-op when the gate is off
 ```
 
-`Wrap` adds `/auth/login`, `/auth/callback`, `/auth/logout`,
-`/auth/logged-out` and `/auth/me`, and requires a signed-in user for every
-other path. No front-end changes are needed:
+The gate owns everything about authentication: the login, setup and error
+pages, the local account, sessions, the OIDC flow, and the routes under
+`/auth/`. **The app has no code for any of it.** Remove the two lines and the
+app has no idea an account ever existed.
 
-- **Browser page loads** without a session are redirected to the IdP and
-  returned to the page they asked for.
-- **Everything else** (fetch/XHR, API clients) gets `401 {"error":"unauthorized"}`.
+The gate is **on by default**. Apps that deliberately sit behind forward auth
+set `MYAPP_AUTH_DISABLED=true`; `FromEnv` then returns `nil`, and
+`(*Gate)(nil).Wrap` returns the handler unchanged.
 
-Handlers behind the gate can read the user:
+## How a visit is routed
 
-```go
-if u, ok := oidcgate.UserFrom(r.Context()); ok { _ = u.Email }
-```
+A request without a session is routed like this (browser page loads are
+redirected; `fetch`/XHR and API clients get `401 {"error":"unauthorized"}`):
 
-### Showing a "Sign out" button only when OIDC is on
+| Account exists? | OIDC configured? | What happens |
+|---|---|---|
+| no | yes | Redirect to the IdP. No local account is created, and `/auth/setup` is closed. |
+| no | no | **Create your account** page (first launch). |
+| yes | yes | Redirect to the IdP first. |
+| yes | no | Local login page. |
 
-`GET /auth/me` returns `{"subject","email","name"}` for a signed-in user and
-`401` otherwise. When OIDC is off the route doesn't exist, so your app
-answers `404`. A front end can therefore do:
+If the IdP does not approve the login (denied, or any failure), the gate shows:
 
-```js
-const res = await fetch('/auth/me');
-if (res.ok) account = await res.json(); // show "Signed in as …" + <a href="/auth/logout">
-```
+- the **local login form** plus a *Try again with OpenID Connect* button, if an
+  account exists and local login is enabled; or
+- an **error page** with *Try again*, otherwise (no account, or local login
+  disabled).
+
+It never redirects to the IdP again while showing that page, so a rejection
+cannot loop.
+
+`/auth/login` is always reachable directly. If the IdP is down, go there to
+use the local account.
+
+**IdP unreachable at startup is not fatal.** The gate starts anyway, retries
+discovery in the background (5 s, doubling to 1 min), and until the provider
+answers, behaves as if OIDC were not available: the local login works. Once
+the provider is reachable it starts redirecting to it.
 
 ## Environment variables
 
@@ -43,17 +58,17 @@ not a letter or digit replaced by `_` (`"my-app"` → `MY_APP`).
 
 | Variable | | |
 |---|---|---|
-| `<APP>_OIDC_ENABLED` | | `true` turns OIDC on. Unset or `false`: the gate is off and nothing changes. |
-| `<APP>_OIDC_ISSUER` | required | IdP issuer URL, e.g. `https://auth.example.com`. |
-| `<APP>_OIDC_CLIENT_ID` | required | Client ID registered at the IdP. |
-| `<APP>_OIDC_CLIENT_SECRET` | required | Client secret (plaintext; the IdP may store only a hash). |
-| `<APP>_OIDC_BASE_URL` | required | External URL of the app, no path: `https://myapp.example.com`. |
-| `<APP>_OIDC_SESSION_SECRET` | optional | Signs the session cookie, min 16 chars. Unset: random per start, so sessions end on restart. |
-| `<APP>_OIDC_PUBLIC_PATHS` | optional | Comma-separated paths that skip auth, added to `/healthz`. A trailing `/` makes it a prefix. |
+| `<APP>_AUTH_DISABLED` | | `true`: no gate at all (the app relies on something else, e.g. forward auth). |
+| `<APP>_AUTH_PUBLIC_PATHS` | optional | Comma-separated paths that skip auth, added to `/healthz`. A trailing `/` makes it a prefix. |
+| `<APP>_OIDC_ENABLED` | | `true` turns OIDC login on. |
+| `<APP>_OIDC_ISSUER` | with OIDC | IdP issuer URL, e.g. `https://auth.example.com`. |
+| `<APP>_OIDC_CLIENT_ID` | with OIDC | Client ID registered at the IdP. |
+| `<APP>_OIDC_CLIENT_SECRET` | with OIDC | Client secret (plaintext; the IdP may store only a hash). |
+| `<APP>_OIDC_BASE_URL` | with OIDC | External URL of the app, no path: `https://myapp.example.com`. |
+| `<APP>_OIDC_DISABLE_BUILT_IN_LOGIN` | optional | `true`: OIDC is the only way in; the local form is hidden **and** refused by the server. Ignored (with a warning) when OIDC is off, so it cannot lock everyone out. |
 
-If OIDC is enabled and anything required is missing, or the issuer cannot be
-reached, `FromEnv` returns an error. The app should exit rather than serve
-unauthenticated.
+If OIDC is enabled and any of its four settings is missing, or a boolean is
+malformed, `FromEnv` returns an error: exit instead of serving unprotected.
 
 ## At the IdP
 
@@ -61,55 +76,87 @@ Register the app as a confidential client:
 
 - Redirect URI: `<BASE_URL>/auth/callback` (logged at startup)
 - Scopes: `openid profile email`
-- Token endpoint auth: `client_secret_basic` (PKCE `S256` is always used)
+- Token endpoint auth: `client_secret_basic`. PKCE `S256` is always used.
 
-**Who may sign in is decided at the IdP**, not here: Authelia access policy /
-`authorization_policy`, Entra "Assignment required", Keycloak client roles,
-and so on. Any user the IdP authenticates for this client is let in.
+**Who may sign in is decided at the IdP**, not here (Authelia policy / group,
+Entra "assignment required", Keycloak roles, …). Any user the IdP
+authenticates for this client is let in, and the gate stores no identity: only
+that this browser is authorized.
 
-Example Authelia client (check keys against your Authelia version):
+## Where state lives
 
-```yaml
-identity_providers:
-  oidc:
-    clients:
-      - client_id: myapp
-        client_name: MyApp
-        client_secret: '$pbkdf2-sha512$...'   # hash of MYAPP_OIDC_CLIENT_SECRET
-        public: false
-        authorization_policy: two_factor
-        redirect_uris: ['https://myapp.example.com/auth/callback']
-        scopes: [openid, profile, email]
-        token_endpoint_auth_method: client_secret_basic
+`/app/data/auth/auth.json` (directory `0700`, file `0600`): the account's
+username and **bcrypt hash**, and the key that signs session cookies. The
+directory is the app's existing `/app/data` volume. The directory must be
+writable by the app's user; `New` fails at startup with a clear message if it
+is not. There is no environment variable to move it.
+
+Creating the account rotates the signing key, so any earlier session ends.
+Sessions are a signed, `HttpOnly`, `SameSite=Lax` cookie (`Secure` when the
+request arrived over HTTPS, directly or via `X-Forwarded-Proto: https`) with a
+sliding 7-day lifetime, and they survive restarts.
+
+**Forgot the password?** Stop the app, delete `auth.json`, start it again
+(the file is read only at startup). The first visitor then sees the setup page
+again, so do it on a network you trust. There is no password-change page.
+
+## A "Sign out" button in the app
+
+The gate cannot decide where your UI puts a button, so the app does, and the
+gate only announces itself. Include one tiny script, hide gate-only UI with one
+CSS rule, and link to `/auth/logout`:
+
+```html
+<script src="/auth/client.js"></script>   <!-- in <head> -->
+<style>html:not([data-oidcgate]) .only-with-gate { display: none !important }</style>
+
+<a class="only-with-gate" href="/auth/logout">Sign out</a>
 ```
 
-## How it works
+`/auth/client.js` sets `document.documentElement.dataset.oidcgate = "on"` and
+`window.oidcgate = { signOutUrl: "/auth/logout" }`. With the gate off the file
+is a 404, the attribute is never set, and everything marked `only-with-gate`
+stays hidden. This works with client-side-rendered UIs, because it is CSS.
 
-- Authorization code flow with PKCE (S256), `state` and `nonce`; the ID token
-  is verified (signature, issuer, audience, expiry, nonce) with
-  [go-oidc](https://github.com/coreos/go-oidc).
-- The session is a stateless HMAC-signed cookie (`HttpOnly`, `SameSite=Lax`,
-  `Secure` when `BASE_URL` is https) with a sliding 7-day lifetime. No server
-  store, no Redis. Cookies are namespaced by app name, so apps on one host
-  don't see each other's sessions.
-- Login failures are logged with detail server-side; the user sees only a
-  generic message. Tokens and secrets are never logged.
-- `/auth/logout` clears the local session only; it does not end the IdP's
-  SSO session.
+## Security notes
+
+- Passwords: bcrypt (cost 12), 8–72 bytes (bcrypt ignores bytes past 72, so
+  longer is refused instead of silently truncated), constant-time-ish
+  verification even for unknown usernames.
+- Local login is rate limited: 5 failures per minute, process-wide, then
+  `429` until the window passes (per-IP is useless behind a proxy). OIDC is
+  unaffected. The trade-off is that someone guessing can block the local form.
+- Forms use a double-submit CSRF token plus a `Sec-Fetch-Site` check.
+- OIDC: authorization code + PKCE (S256), `state`, `nonce`; the ID token is
+  verified (signature, issuer, audience, expiry, nonce) with
+  [go-oidc](https://github.com/coreos/go-oidc). Failures are logged with
+  detail server-side; the user sees a generic message. Tokens and secrets are
+  never logged.
+- `?next=` is accepted only as a local path, and every redirect is re-checked.
+- Gate pages are static, take no scripts, and send `no-store`, a strict CSP,
+  `X-Frame-Options: DENY` and `Referrer-Policy: same-origin`.
+- Setup is closed whenever an account exists or OIDC is configured, so nobody
+  can claim an app by being first once it is set up.
+
+This is security-critical code. It is covered by tests (run with `-race`) and
+scanned with `gosec` and `govulncheck`, but it has had no independent review:
+treat it accordingly.
 
 ## Limits
 
+- One local account; no password-change or multi-user support.
 - `BASE_URL` must not contain a path (no sub-path hosting).
-- Signing the same app in from several hosts needs one client per host.
-- Cookie `SameSite=Lax` is the CSRF defence for state-changing requests.
+- Each host needs its own client at the IdP.
+- Not a replacement for authorization inside the app: it answers "is this
+  browser signed in?", nothing finer.
 
 ## Options
 
-For the rare case the environment isn't enough:
-`oidcgate.WithPublicPaths(...)`, `WithSessionTTL(d)`, `WithLogger(l)`; or build
-a `Config` and call `oidcgate.New(ctx, cfg)`.
+For the rare case the environment isn't enough: `WithPublicPaths(...)`,
+`WithSessionTTL(d)`, `WithLogger(l)`, `WithDataDir(dir)`, or build a `Config`
+and call `oidcgate.New(ctx, cfg)`.
 
 ## Testing
 
-`go test -race ./...` runs the whole flow against an in-process fake IdP;
-nothing talks to a real provider.
+`go test -race ./...` runs every flow against an in-process fake IdP; nothing
+talks to a real provider.

@@ -9,10 +9,13 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -20,31 +23,53 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+	"golang.org/x/crypto/bcrypt"
 )
+
+var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+// TestMain lowers the bcrypt cost: at the production cost every hash takes
+// seconds under the race detector, which also breaks the rate-limit timing.
+func TestMain(m *testing.M) {
+	bcryptCost = bcrypt.MinCost
+	os.Exit(m.Run())
+}
+
+// --- fake IdP ----------------------------------------------------------
 
 // fakeIdP is a minimal OIDC provider: discovery, authorize (auto-approves),
 // token (verifies PKCE and the client secret) and JWKS.
 type fakeIdP struct {
-	*httptest.Server
+	URL string
+	l   net.Listener
 	key *rsa.PrivateKey
+	mux *http.ServeMux
 
-	mu         sync.Mutex
-	challenge  map[string]string // code -> PKCE challenge
-	nonce      map[string]string // code -> nonce
-	badNonce   bool              // return a wrong nonce in the id_token
-	denyLogin  bool              // authorize returns access_denied
-	tokenCalls int
+	mu        sync.Mutex
+	challenge map[string]string // code -> PKCE challenge
+	nonce     map[string]string // code -> nonce
+	badNonce  bool              // return a wrong nonce in the id_token
+	denyLogin bool              // authorize returns access_denied
 }
 
+// newFakeIdP reserves an address; Start brings it up. Splitting them lets a
+// test begin with the provider unreachable.
 func newFakeIdP(t *testing.T) *fakeIdP {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeIdP{key: key, challenge: map[string]string{}, nonce: map[string]string{}}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeIdP{URL: "http://" + l.Addr().String(), l: l, key: key, mux: http.NewServeMux(),
+		challenge: map[string]string{}, nonce: map[string]string{}}
+	t.Cleanup(func() { l.Close() })
+
+	f.mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"issuer":                                f.URL,
 			"authorization_endpoint":                f.URL + "/authorize",
@@ -53,12 +78,13 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 			"id_token_signing_alg_values_supported": []string{"RS256"},
 		})
 	})
-	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
+	f.mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{
 			{Key: &key.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"},
 		}})
 	})
-	mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
+	f.mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		redirect, _ := url.Parse(q.Get("redirect_uri"))
 		rq := redirect.Query()
@@ -76,12 +102,10 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 		redirect.RawQuery = rq.Encode()
 		http.Redirect(w, r, redirect.String(), http.StatusFound)
 	})
-	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+	f.mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		f.tokenCalls++
 		if id, secret, ok := r.BasicAuth(); !ok || id != "cid" || secret != "csecret" {
-			// oauth2 may also send credentials in the body.
 			if r.FormValue("client_id") != "cid" || r.FormValue("client_secret") != "csecret" {
 				http.Error(w, `{"error":"invalid_client"}`, http.StatusUnauthorized)
 				return
@@ -107,56 +131,75 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 			Audience: jwt.Audience{"cid"},
 			Expiry:   jwt.NewNumericDate(time.Now().Add(time.Hour)),
 			IssuedAt: jwt.NewNumericDate(time.Now()),
-		}).Claims(map[string]any{"nonce": nonce, "email": "a@example.com", "name": "Alice"}).Serialize()
+		}).Claims(map[string]any{"nonce": nonce, "email": "a@example.com"}).Serialize()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"access_token": "at", "token_type": "Bearer", "id_token": raw})
 	})
-	f.Server = httptest.NewServer(mux)
-	t.Cleanup(f.Close)
 	return f
 }
 
-// newApp starts an app guarded by a Gate pointed at idp. The app echoes the
-// signed-in user's email.
-func newApp(t *testing.T, idp *fakeIdP, mutate func(*Config)) (*httptest.Server, *Gate) {
+func (f *fakeIdP) Start() { go http.Serve(f.l, f.mux) }
+
+// --- app harness -------------------------------------------------------
+
+var inner = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/healthz" {
+		io.WriteString(w, "ok")
+		return
+	}
+	io.WriteString(w, "hello app")
+})
+
+// startApp serves `inner` behind a gate built from cfg.
+func startApp(t *testing.T, cfg Config) (*httptest.Server, *Gate) {
 	t.Helper()
 	var g *Gate
 	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		g.Wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/healthz" {
-				io.WriteString(w, "ok")
-				return
-			}
-			u, _ := UserFrom(r.Context())
-			io.WriteString(w, "hello "+u.Email+" "+u.Name)
-		})).ServeHTTP(w, r)
+		g.Wrap(inner).ServeHTTP(w, r)
 	}))
 	t.Cleanup(app.Close)
 
-	cfg := Config{
-		App: "my-app", Issuer: idp.URL, ClientID: "cid", ClientSecret: "csecret",
-		BaseURL: app.URL, SessionSecret: "0123456789abcdef",
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	cfg.App = "my-app"
+	cfg.Logger = quiet
+	if cfg.DataDir == "" {
+		cfg.DataDir = t.TempDir()
 	}
-	if mutate != nil {
-		mutate(&cfg)
+	if cfg.OIDC != nil && cfg.OIDC.BaseURL == "" {
+		cfg.OIDC.BaseURL = app.URL
 	}
 	var err error
-	g, err = New(context.Background(), cfg)
-	if err != nil {
+	if g, err = New(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
 	return app, g
 }
 
-func browser(t *testing.T) *http.Client {
+func oidcCfg(idp *fakeIdP) *OIDCConfig {
+	return &OIDCConfig{Issuer: idp.URL, ClientID: "cid", ClientSecret: "csecret"}
+}
+
+func browser() *http.Client {
 	jar, _ := cookiejar.New(nil)
 	return &http.Client{Jar: jar}
 }
 
-func get(t *testing.T, c *http.Client, u string, hdr map[string]string) (*http.Response, string) {
+func noRedirect(c *http.Client) *http.Client {
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return c
+}
+
+var nav = map[string]string{"Sec-Fetch-Mode": "navigate"}
+
+func do(t *testing.T, c *http.Client, method, u string, form url.Values, hdr map[string]string) (*http.Response, string) {
 	t.Helper()
-	req, _ := http.NewRequest(http.MethodGet, u, nil)
+	var body io.Reader
+	if form != nil {
+		body = strings.NewReader(form.Encode())
+	}
+	req, _ := http.NewRequest(method, u, body)
+	if form != nil {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
 	for k, v := range hdr {
 		req.Header.Set(k, v)
 	}
@@ -169,92 +212,217 @@ func get(t *testing.T, c *http.Client, u string, hdr map[string]string) (*http.R
 	return res, string(b)
 }
 
-func noRedirect(c *http.Client) *http.Client {
-	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+func get(t *testing.T, c *http.Client, u string, hdr map[string]string) (*http.Response, string) {
+	return do(t, c, http.MethodGet, u, nil, hdr)
+}
+
+var csrfRe = regexp.MustCompile(`name="csrf" value="([^"]+)"`)
+
+// formToken loads a gate page and returns its CSRF token (the cookie lands in c's jar).
+func formToken(t *testing.T, c *http.Client, u string) string {
+	t.Helper()
+	res, body := get(t, c, u, nav)
+	m := csrfRe.FindStringSubmatch(body)
+	if m == nil {
+		t.Fatalf("no csrf token on %s (status %d): %.200s", u, res.StatusCode, body)
+	}
+	return m[1]
+}
+
+// signedUp makes an account directly and returns a browser signed in through the form.
+func signedIn(t *testing.T, app *httptest.Server, g *Gate) *http.Client {
+	t.Helper()
+	if !g.store.hasAccount() {
+		if err := g.store.createAccount("alice", "correct horse"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := browser()
+	tok := formToken(t, c, app.URL+"/auth/login")
+	res, body := do(t, c, "POST", app.URL+"/auth/login", url.Values{"username": {"alice"}, "password": {"correct horse"}, "csrf": {tok}}, nil)
+	if res.StatusCode != 200 || body != "hello app" {
+		t.Fatalf("sign-in failed: %d %.200s", res.StatusCode, body)
+	}
 	return c
 }
 
-var nav = map[string]string{"Sec-Fetch-Mode": "navigate"}
+// --- local account -----------------------------------------------------
 
-func TestFullLoginFlow(t *testing.T) {
-	idp := newFakeIdP(t)
-	app, _ := newApp(t, idp, nil)
-	c := browser(t)
-
-	res, body := get(t, c, app.URL+"/some/page?x=1", nav)
-	if res.StatusCode != 200 || body != "hello a@example.com Alice" {
-		t.Fatalf("after login flow: %d %q", res.StatusCode, body)
-	}
-	if res.Request.URL.Path != "/some/page" || res.Request.URL.RawQuery != "x=1" {
-		t.Errorf("not returned to original page: %s", res.Request.URL)
-	}
-	// Second request uses the session cookie only: no more IdP round trips.
-	idp.mu.Lock()
-	calls := idp.tokenCalls
-	idp.mu.Unlock()
-	if _, body := get(t, c, app.URL+"/", nav); body != "hello a@example.com Alice" {
-		t.Errorf("session not reused: %q", body)
-	}
-	if idp.tokenCalls != calls {
-		t.Error("second request triggered another login")
-	}
-}
-
-func TestUnauthenticated(t *testing.T) {
-	idp := newFakeIdP(t)
-	app, _ := newApp(t, idp, nil)
-	c := noRedirect(browser(t))
+func TestFirstLaunchLocalOnly(t *testing.T) {
+	app, _ := startApp(t, Config{})
+	c := noRedirect(browser())
 
 	res, _ := get(t, c, app.URL+"/page?a=b", nav)
-	if res.StatusCode != 302 || res.Header.Get("Location") != "/auth/login?next=%2Fpage%3Fa%3Db" {
+	if res.StatusCode != 302 || res.Header.Get("Location") != "/auth/setup?next=%2Fpage%3Fa%3Db" {
 		t.Errorf("navigation: %d %s", res.StatusCode, res.Header.Get("Location"))
 	}
-	res, body := get(t, c, app.URL+"/api/x", map[string]string{"Sec-Fetch-Mode": "cors"})
-	if res.StatusCode != 401 || !strings.Contains(body, "unauthorized") {
+	if res, body := get(t, c, app.URL+"/api/x", map[string]string{"Sec-Fetch-Mode": "cors"}); res.StatusCode != 401 || !strings.Contains(body, "unauthorized") {
 		t.Errorf("fetch: %d %q", res.StatusCode, body)
 	}
-	res, _ = get(t, c, app.URL+"/api/x", nil)
-	if res.StatusCode != 401 {
+	if res, _ := get(t, c, app.URL+"/api/x", nil); res.StatusCode != 401 {
 		t.Errorf("plain API client: %d", res.StatusCode)
 	}
-	res, body = get(t, c, app.URL+"/healthz", nil)
-	if res.StatusCode != 200 || body != "ok" {
+	if res, body := get(t, c, app.URL+"/healthz", nil); res.StatusCode != 200 || body != "ok" {
 		t.Errorf("healthz should be public: %d %q", res.StatusCode, body)
 	}
-}
-
-func TestPublicPaths(t *testing.T) {
-	idp := newFakeIdP(t)
-	app, _ := newApp(t, idp, func(c *Config) { c.PublicPaths = []string{"/hook", "/static/"} })
-	c := noRedirect(browser(t))
-	for path, want := range map[string]int{"/hook": 200, "/hooks": 401, "/static/a.js": 200, "/staticx": 401} {
-		if res, _ := get(t, c, app.URL+path, nil); res.StatusCode != want {
-			t.Errorf("%s: got %d want %d", path, res.StatusCode, want)
-		}
+	// OIDC routes do not exist without OIDC.
+	if res, _ := get(t, c, app.URL+"/auth/oidc", nav); res.StatusCode != 404 {
+		t.Errorf("/auth/oidc without OIDC: %d", res.StatusCode)
 	}
 }
 
-func TestTamperedAndExpiredSession(t *testing.T) {
-	idp := newFakeIdP(t)
-	app, g := newApp(t, idp, nil)
-	c := noRedirect(browser(t))
-	u, _ := url.Parse(app.URL)
+func TestClientJS(t *testing.T) {
+	app, _ := startApp(t, Config{})
+	res, body := get(t, noRedirect(browser()), app.URL+"/auth/client.js", nil)
+	if res.StatusCode != 200 || !strings.HasPrefix(res.Header.Get("Content-Type"), "application/javascript") {
+		t.Fatalf("client.js: %d %s", res.StatusCode, res.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(body, `dataset.oidcgate="on"`) || !strings.Contains(body, "/auth/logout") {
+		t.Errorf("unexpected script: %q", body)
+	}
+	if res.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Error("client.js should be nosniff")
+	}
+}
 
+func TestSetupFlow(t *testing.T) {
+	app, g := startApp(t, Config{})
+	c := browser()
+
+	_, body := get(t, c, app.URL+"/some/page", nav)
+	if !strings.Contains(body, "Create your account") {
+		t.Fatalf("first launch should land on setup: %.200s", body)
+	}
+	tok := formToken(t, c, app.URL+"/auth/setup")
+	post := func(v url.Values) (*http.Response, string) {
+		v.Set("csrf", tok)
+		return do(t, c, "POST", app.URL+"/auth/setup", v, nil)
+	}
+
+	for name, tc := range map[string]struct {
+		v    url.Values
+		want string
+		code int
+	}{
+		"short password": {url.Values{"username": {"alice"}, "password": {"short"}, "confirm": {"short"}}, "at least 8", 400},
+		"long password":  {url.Values{"username": {"alice"}, "password": {strings.Repeat("x", 73)}, "confirm": {strings.Repeat("x", 73)}}, "at most 72", 400},
+		"mismatch":       {url.Values{"username": {"alice"}, "password": {"correct horse"}, "confirm": {"correct hors3"}}, "do not match", 400},
+		"no username":    {url.Values{"username": {"  "}, "password": {"correct horse"}, "confirm": {"correct horse"}}, "Enter a username", 400},
+	} {
+		res, body := post(tc.v)
+		if res.StatusCode != tc.code || !strings.Contains(body, tc.want) {
+			t.Errorf("%s: %d %.150s", name, res.StatusCode, body)
+		}
+		if g.store.hasAccount() {
+			t.Fatalf("%s: account created despite the error", name)
+		}
+	}
+
+	res, body := do(t, c, "POST", app.URL+"/auth/setup", url.Values{"username": {"alice"}, "password": {"correct horse"}, "confirm": {"correct horse"}, "csrf": {"forged"}, "next": {"/some/page"}}, nil)
+	if res.StatusCode != 403 || g.store.hasAccount() {
+		t.Fatalf("bad CSRF token accepted: %d", res.StatusCode)
+	}
+
+	res, body = post(url.Values{"username": {"alice"}, "password": {"correct horse"}, "confirm": {"correct horse"}, "next": {"/some/page"}})
+	if res.StatusCode != 200 || body != "hello app" || res.Request.URL.Path != "/some/page" {
+		t.Fatalf("setup should sign in and return to the page: %d %q at %s", res.StatusCode, body, res.Request.URL.Path)
+	}
+	if !g.store.hasAccount() {
+		t.Fatal("account not stored")
+	}
+
+	// A second visitor cannot create another account or take over.
+	other := browser()
+	otherTok := formToken(t, other, app.URL+"/auth/login")
+	res, _ = do(t, noRedirect(other), "POST", app.URL+"/auth/setup", url.Values{"username": {"mallory"}, "password": {"hunter2hunter2"}, "confirm": {"hunter2hunter2"}, "csrf": {otherTok}}, nil)
+	if res.StatusCode != 302 || !g.store.verify("alice", "correct horse") || g.store.verify("mallory", "hunter2hunter2") {
+		t.Errorf("setup must be closed once an account exists (status %d)", res.StatusCode)
+	}
+}
+
+func TestLoginLogoutAndRateLimit(t *testing.T) {
+	app, g := startApp(t, Config{})
+	if err := g.store.createAccount("alice", "correct horse"); err != nil {
+		t.Fatal(err)
+	}
+	c := browser()
+
+	_, body := get(t, c, app.URL+"/dash", nav)
+	if !strings.Contains(body, `action="/auth/login"`) || strings.Contains(body, "OpenID") {
+		t.Fatalf("expected the local login page only: %.300s", body)
+	}
+	tok := formToken(t, c, app.URL+"/auth/login")
+	login := func(user, pass string) (*http.Response, string) {
+		return do(t, c, "POST", app.URL+"/auth/login", url.Values{"username": {user}, "password": {pass}, "csrf": {tok}, "next": {"/dash"}}, nil)
+	}
+
+	g.lim.window = 150 * time.Millisecond
+	for i := 0; i < 5; i++ {
+		if res, body := login("alice", "wrong password"); res.StatusCode != 401 || !strings.Contains(body, "Invalid username or password") {
+			t.Fatalf("wrong password #%d: %d", i, res.StatusCode)
+		}
+	}
+	if res, _ := login("nobody", "wrong password"); res.StatusCode != 429 {
+		t.Errorf("limiter should block after 5 failures, got %d", res.StatusCode)
+	}
+	if res, _ := login("alice", "correct horse"); res.StatusCode != 429 {
+		t.Errorf("the correct password must also wait out the window, got %d", res.StatusCode)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	if res, body := login("ALICE", "correct horse"); res.StatusCode != 401 {
+		t.Errorf("usernames are case-sensitive: %d %.100s", res.StatusCode, body)
+	}
+	res, body := login("alice", "correct horse")
+	if res.StatusCode != 200 || body != "hello app" || res.Request.URL.Path != "/dash" {
+		t.Fatalf("login: %d %q at %s", res.StatusCode, body, res.Request.URL.Path)
+	}
+
+	res, body = get(t, c, app.URL+"/auth/logout", nav)
+	if res.Request.URL.Path != "/auth/logged-out" || !strings.Contains(body, "signed out") {
+		t.Errorf("logout landing: %s %.100s", res.Request.URL.Path, body)
+	}
+	if res, _ := get(t, noRedirect(c), app.URL+"/api", nil); res.StatusCode != 401 {
+		t.Errorf("still signed in after logout: %d", res.StatusCode)
+	}
+}
+
+func TestCSRFAndMethods(t *testing.T) {
+	app, g := startApp(t, Config{})
+	_ = g.store.createAccount("alice", "correct horse")
+	c := browser()
+	tok := formToken(t, c, app.URL+"/auth/login")
+	good := url.Values{"username": {"alice"}, "password": {"correct horse"}, "csrf": {tok}}
+
+	if res, _ := do(t, noRedirect(c), "POST", app.URL+"/auth/login", good, map[string]string{"Sec-Fetch-Site": "cross-site"}); res.StatusCode != 403 {
+		t.Errorf("cross-site POST accepted: %d", res.StatusCode)
+	}
+	if res, _ := do(t, noRedirect(browser()), "POST", app.URL+"/auth/login", good, nil); res.StatusCode != 403 {
+		t.Errorf("POST without the CSRF cookie accepted: %d", res.StatusCode)
+	}
+	if res, _ := do(t, noRedirect(c), "PUT", app.URL+"/auth/login", good, nil); res.StatusCode != 405 {
+		t.Errorf("PUT: %d", res.StatusCode)
+	}
+}
+
+func TestSessionCookieValidation(t *testing.T) {
+	app, g := startApp(t, Config{})
+	u, _ := url.Parse(app.URL)
+	c := noRedirect(browser())
 	set := func(val string) {
 		c.Jar.SetCookies(u, []*http.Cookie{{Name: g.sessionCookie, Value: val, Path: "/"}})
 	}
-	valid := g.seal(purposeSession, sessionClaims{Sub: "x", Exp: time.Now().Add(time.Hour).Unix()})
+	valid := g.seal(purposeSession, sessionClaims{Exp: time.Now().Add(time.Hour).Unix()})
 	set(valid)
 	if res, _ := get(t, c, app.URL+"/", nil); res.StatusCode != 200 {
 		t.Fatalf("valid cookie rejected: %d", res.StatusCode)
 	}
-	forged := (&Gate{key: []byte("another-secret-key")}).seal(purposeSession, sessionClaims{Sub: "x", Exp: time.Now().Add(time.Hour).Unix()})
+	other := startOtherKey(t)
 	for name, v := range map[string]string{
-		"forged key":  forged,
+		"forged key":  other.seal(purposeSession, sessionClaims{Exp: time.Now().Add(time.Hour).Unix()}),
 		"tampered":    "e30" + valid[strings.Index(valid, "."):],
-		"expired":     g.seal(purposeSession, sessionClaims{Sub: "x", Exp: time.Now().Add(-time.Minute).Unix()}),
-		"wrong kind":  g.seal(purposeFlow, sessionClaims{Sub: "x", Exp: time.Now().Add(time.Hour).Unix()}),
-		"no subject":  g.seal(purposeSession, sessionClaims{Exp: time.Now().Add(time.Hour).Unix()}),
+		"expired":     g.seal(purposeSession, sessionClaims{Exp: time.Now().Add(-time.Minute).Unix()}),
+		"wrong kind":  g.seal(purposeFlow, sessionClaims{Exp: time.Now().Add(time.Hour).Unix()}),
 		"garbage":     "nonsense",
 		"empty parts": ".",
 	} {
@@ -265,146 +433,523 @@ func TestTamperedAndExpiredSession(t *testing.T) {
 	}
 }
 
+// startOtherKey makes an unrelated gate, to forge cookies with a different key.
+func startOtherKey(t *testing.T) *Gate {
+	g, err := New(context.Background(), Config{App: "my-app", DataDir: t.TempDir(), Logger: quiet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g
+}
+
 func TestSlidingSessionRefresh(t *testing.T) {
-	idp := newFakeIdP(t)
-	app, g := newApp(t, idp, nil)
-	c := noRedirect(browser(t))
+	app, g := startApp(t, Config{})
+	c := noRedirect(browser())
 	u, _ := url.Parse(app.URL)
 	c.Jar.SetCookies(u, []*http.Cookie{{Name: g.sessionCookie, Path: "/",
-		Value: g.seal(purposeSession, sessionClaims{Sub: "x", Exp: time.Now().Add(time.Hour).Unix()})}})
+		Value: g.seal(purposeSession, sessionClaims{Exp: time.Now().Add(time.Hour).Unix()})}})
 	res, _ := get(t, c, app.URL+"/", nil)
 	if res.StatusCode != 200 || len(res.Cookies()) == 0 {
 		t.Errorf("expected a refreshed cookie, got status %d, cookies %v", res.StatusCode, res.Cookies())
 	}
 }
 
-func TestCallbackRejections(t *testing.T) {
-	login := func(t *testing.T, idp *fakeIdP, app *httptest.Server) (*http.Client, string) {
-		c := noRedirect(browser(t))
-		res, _ := get(t, c, app.URL+"/auth/login", nil)
-		if res.StatusCode != 302 {
-			t.Fatalf("login: %d", res.StatusCode)
+func TestSessionCarriesNoIdentity(t *testing.T) {
+	app, g := startApp(t, Config{})
+	c := signedIn(t, app, g)
+	u, _ := url.Parse(app.URL)
+	var raw string
+	for _, ck := range c.Jar.Cookies(u) {
+		if ck.Name == g.sessionCookie {
+			raw = ck.Value
 		}
-		return c, res.Header.Get("Location")
 	}
+	payload, _, _ := strings.Cut(raw, ".")
+	b, _ := base64.RawURLEncoding.DecodeString(payload)
+	var m map[string]any
+	_ = json.Unmarshal(b, &m)
+	if len(m) != 1 || m["exp"] == nil {
+		t.Errorf("session payload should be only an expiry, got %v", m)
+	}
+}
 
-	t.Run("state mismatch", func(t *testing.T) {
-		idp := newFakeIdP(t)
-		app, _ := newApp(t, idp, nil)
-		c, _ := login(t, idp, app)
-		res, _ := get(t, c, app.URL+"/auth/callback?code=x&state=forged", nil)
-		if res.StatusCode != 400 {
-			t.Errorf("got %d", res.StatusCode)
+func TestCreatingTheAccountEndsEarlierSessions(t *testing.T) {
+	app, g := startApp(t, Config{})
+	old := g.seal(purposeSession, sessionClaims{Exp: time.Now().Add(time.Hour).Unix()}) // e.g. from an earlier OIDC-only period
+	if err := g.store.createAccount("alice", "correct horse"); err != nil {
+		t.Fatal(err)
+	}
+	c := noRedirect(browser())
+	u, _ := url.Parse(app.URL)
+	c.Jar.SetCookies(u, []*http.Cookie{{Name: g.sessionCookie, Value: old, Path: "/"}})
+	if res, _ := get(t, c, app.URL+"/", nil); res.StatusCode != 401 {
+		t.Errorf("a session from before the account existed must not survive: %d", res.StatusCode)
+	}
+}
+
+func TestStatePersistsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	app, g := startApp(t, Config{DataDir: dir})
+	c := signedIn(t, app, g)
+	u, _ := url.Parse(app.URL)
+
+	// "Restart": a new Gate over the same directory, behind a new server.
+	g2, err := New(context.Background(), Config{App: "my-app", DataDir: dir, Logger: quiet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	app2 := httptest.NewServer(g2.Wrap(inner))
+	t.Cleanup(app2.Close)
+	u2, _ := url.Parse(app2.URL)
+	c.Jar.SetCookies(u2, c.Jar.Cookies(u))
+	if res, body := get(t, noRedirect(c), app2.URL+"/", nil); res.StatusCode != 200 || body != "hello app" {
+		t.Errorf("session did not survive a restart: %d", res.StatusCode)
+	}
+	if !g2.store.verify("alice", "correct horse") {
+		t.Error("account did not survive a restart")
+	}
+}
+
+func TestStoreFilePermissions(t *testing.T) {
+	dir := t.TempDir() + "/auth"
+	_, g := startApp(t, Config{DataDir: dir})
+	_ = g.store.createAccount("alice", "correct horse")
+	di, _ := os.Stat(dir)
+	fi, err := os.Stat(dir + "/auth.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if di.Mode().Perm() != 0o700 || fi.Mode().Perm() != 0o600 {
+		t.Errorf("modes: dir %v file %v, want 0700/0600", di.Mode().Perm(), fi.Mode().Perm())
+	}
+	raw, _ := os.ReadFile(dir + "/auth.json")
+	if strings.Contains(string(raw), "correct horse") || !strings.Contains(string(raw), "$2a$") {
+		t.Error("the password must be stored only as a bcrypt hash")
+	}
+}
+
+func TestNewFailsWhenDataDirNotWritable(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	ro := t.TempDir()
+	if err := os.Chmod(ro, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(ro, 0o700) })
+	_, err := New(context.Background(), Config{App: "my-app", DataDir: ro + "/auth", Logger: quiet})
+	if err == nil || !strings.Contains(err.Error(), "writable") {
+		t.Errorf("expected a clear data-directory error, got %v", err)
+	}
+}
+
+func TestPagesEscapeInput(t *testing.T) {
+	app, g := startApp(t, Config{})
+	_ = g.store.createAccount("alice", "correct horse")
+	_, body := get(t, browser(), app.URL+`/auth/login?next=/%22%3E%3Cscript%3Ealert(1)%3C/script%3E`, nav)
+	if strings.Contains(body, "<script>alert") {
+		t.Error("?next= was reflected unescaped")
+	}
+	res, _ := get(t, browser(), app.URL+"/auth/login", nav)
+	for h, want := range map[string]string{"Cache-Control": "no-store", "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff"} {
+		if res.Header.Get(h) != want {
+			t.Errorf("%s = %q, want %q", h, res.Header.Get(h), want)
+		}
+	}
+	if !strings.Contains(res.Header.Get("Content-Security-Policy"), "frame-ancestors 'none'") {
+		t.Error("missing CSP")
+	}
+}
+
+func TestCookiesSecureBehindHTTPSProxy(t *testing.T) {
+	app, g := startApp(t, Config{})
+	_ = g.store.createAccount("alice", "correct horse")
+	res, _ := get(t, noRedirect(browser()), app.URL+"/auth/login", map[string]string{"X-Forwarded-Proto": "https"})
+	var found bool
+	for _, ck := range res.Cookies() {
+		found = true
+		if !ck.Secure || !ck.HttpOnly || ck.SameSite != http.SameSiteLaxMode {
+			t.Errorf("cookie %s: secure=%v httponly=%v samesite=%v", ck.Name, ck.Secure, ck.HttpOnly, ck.SameSite)
+		}
+	}
+	if !found {
+		t.Error("expected a CSRF cookie")
+	}
+	res, _ = get(t, noRedirect(browser()), app.URL+"/auth/login", nil)
+	for _, ck := range res.Cookies() {
+		if ck.Secure {
+			t.Errorf("cookie %s is Secure over plain http", ck.Name)
+		}
+	}
+}
+
+// --- OIDC (fake IdP) ---------------------------------------------------
+
+func TestOIDCFirstLaunchRedirectsStraightToIdP(t *testing.T) {
+	idp := newFakeIdP(t)
+	idp.Start()
+	app, g := startApp(t, Config{OIDC: oidcCfg(idp)})
+
+	res, body := get(t, browser(), app.URL+"/some/page?x=1", nav)
+	if res.StatusCode != 200 || body != "hello app" || res.Request.URL.Path != "/some/page" || res.Request.URL.RawQuery != "x=1" {
+		t.Fatalf("first launch + OIDC: %d %q at %s", res.StatusCode, body, res.Request.URL)
+	}
+	if g.store.hasAccount() {
+		t.Error("no local account should be created when OIDC is configured")
+	}
+	// Setup is closed: nobody can claim the app by being first.
+	if res, _ := get(t, noRedirect(browser()), app.URL+"/auth/setup", nav); res.StatusCode != 302 || res.Header.Get("Location") != "/auth/login" {
+		t.Errorf("setup should be closed with OIDC: %d %s", res.StatusCode, res.Header.Get("Location"))
+	}
+}
+
+func TestOIDCWithAccountStillRedirectsFirst(t *testing.T) {
+	idp := newFakeIdP(t)
+	idp.Start()
+	app, g := startApp(t, Config{OIDC: oidcCfg(idp)})
+	_ = g.store.createAccount("alice", "correct horse")
+
+	res, _ := get(t, noRedirect(browser()), app.URL+"/dash", nav)
+	if res.StatusCode != 302 || res.Header.Get("Location") != "/auth/oidc?next=%2Fdash" {
+		t.Fatalf("expected an immediate OIDC redirect, got %d %s", res.StatusCode, res.Header.Get("Location"))
+	}
+	if _, body := get(t, browser(), app.URL+"/dash", nav); body != "hello app" {
+		t.Errorf("OIDC login with an existing account: %q", body)
+	}
+}
+
+func TestOIDCAuthorizeRequestUsesPKCE(t *testing.T) {
+	idp := newFakeIdP(t)
+	idp.Start()
+	app, _ := startApp(t, Config{OIDC: oidcCfg(idp)})
+	res, _ := get(t, noRedirect(browser()), app.URL+"/auth/oidc", nil)
+	loc, _ := url.Parse(res.Header.Get("Location"))
+	q := loc.Query()
+	if q.Get("code_challenge_method") != "S256" || q.Get("code_challenge") == "" || q.Get("state") == "" || q.Get("nonce") == "" ||
+		q.Get("redirect_uri") != app.URL+"/auth/callback" || q.Get("response_type") != "code" {
+		t.Errorf("bad authorize request: %v", q)
+	}
+}
+
+func TestOIDCDeniedFallsBackWithoutLooping(t *testing.T) {
+	idp := newFakeIdP(t)
+	idp.Start()
+	idp.denyLogin = true
+
+	t.Run("local login enabled: login page with a retry button", func(t *testing.T) {
+		app, g := startApp(t, Config{OIDC: oidcCfg(idp)})
+		_ = g.store.createAccount("alice", "correct horse")
+		res, body := get(t, browser(), app.URL+"/dash", nav) // a redirect loop would make the client error out
+		if res.StatusCode != 200 || res.Request.URL.Path != "/auth/login" {
+			t.Fatalf("%d at %s", res.StatusCode, res.Request.URL)
+		}
+		for _, want := range []string{`action="/auth/login"`, "Try again with OpenID Connect", "not approved by the identity provider"} {
+			if !strings.Contains(body, want) {
+				t.Errorf("page is missing %q", want)
+			}
 		}
 	})
-	t.Run("no flow cookie", func(t *testing.T) {
-		idp := newFakeIdP(t)
-		app, _ := newApp(t, idp, nil)
-		res, _ := get(t, noRedirect(browser(t)), app.URL+"/auth/callback?code=x&state=y", nil)
-		if res.StatusCode != 400 {
-			t.Errorf("got %d", res.StatusCode)
+	t.Run("local login disabled: error page, no form", func(t *testing.T) {
+		app, g := startApp(t, Config{OIDC: oidcCfg(idp), DisableBuiltInLogin: true})
+		_ = g.store.createAccount("alice", "correct horse")
+		res, body := get(t, browser(), app.URL+"/dash", nav)
+		if res.StatusCode != 200 || strings.Contains(body, "<form") || !strings.Contains(body, "Sign-in failed") || !strings.Contains(body, "Try again") {
+			t.Errorf("%d %.300s", res.StatusCode, body)
+		}
+		// The server refuses local login too, not just the UI.
+		c := browser()
+		_, _ = get(t, c, app.URL+"/auth/login", nav)
+		u, _ := url.Parse(app.URL)
+		var tok string
+		for _, ck := range c.Jar.Cookies(u) {
+			if ck.Name == g.csrfCookie {
+				tok = ck.Value
+			}
+		}
+		if res, _ := do(t, noRedirect(c), "POST", app.URL+"/auth/login", url.Values{"username": {"alice"}, "password": {"correct horse"}, "csrf": {tok}}, nil); res.StatusCode != 403 {
+			t.Errorf("local login must be refused when disabled: %d", res.StatusCode)
 		}
 	})
-	t.Run("nonce mismatch", func(t *testing.T) {
-		idp := newFakeIdP(t)
-		idp.badNonce = true
-		app, _ := newApp(t, idp, nil)
-		res, _ := get(t, browser(t), app.URL+"/", nav)
-		if res.StatusCode != 400 {
-			t.Errorf("got %d", res.StatusCode)
+	t.Run("first launch: error page, no local form", func(t *testing.T) {
+		app, _ := startApp(t, Config{OIDC: oidcCfg(idp)})
+		res, body := get(t, browser(), app.URL+"/", nav)
+		if res.StatusCode != 200 || strings.Contains(body, "<form") || !strings.Contains(body, "Try again") {
+			t.Errorf("%d %.300s", res.StatusCode, body)
 		}
 	})
-	t.Run("access denied at IdP", func(t *testing.T) {
-		idp := newFakeIdP(t)
-		idp.denyLogin = true
-		app, _ := newApp(t, idp, nil)
-		res, _ := get(t, browser(t), app.URL+"/", nav)
-		if res.StatusCode != 403 {
-			t.Errorf("got %d", res.StatusCode)
-		}
-	})
+}
+
+func TestOIDCLocalLoginEscapeHatch(t *testing.T) {
+	idp := newFakeIdP(t)
+	idp.Start()
+	app, g := startApp(t, Config{OIDC: oidcCfg(idp)})
+	_ = g.store.createAccount("alice", "correct horse")
+	_, body := get(t, browser(), app.URL+"/auth/login", nav)
+	if !strings.Contains(body, `action="/auth/login"`) || !strings.Contains(body, "Sign in with OpenID Connect") {
+		t.Errorf("/auth/login must always offer the local form and the OIDC button: %.300s", body)
+	}
+	// And local sign-in works while OIDC is configured.
+	c := signedIn(t, app, g)
+	if _, body := get(t, c, app.URL+"/", nav); body != "hello app" {
+		t.Errorf("local login with OIDC configured: %q", body)
+	}
+}
+
+func TestOIDCRejections(t *testing.T) {
+	cases := map[string]func(*fakeIdP){
+		"nonce mismatch": func(f *fakeIdP) { f.badNonce = true },
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			idp := newFakeIdP(t)
+			idp.Start()
+			setup(idp)
+			app, _ := startApp(t, Config{OIDC: oidcCfg(idp)})
+			res, body := get(t, browser(), app.URL+"/", nav)
+			if res.Request.URL.Path != "/auth/login" || body == "hello app" || !strings.Contains(body, "Sign-in failed") {
+				t.Errorf("%s: %d at %s", name, res.StatusCode, res.Request.URL)
+			}
+		})
+	}
 	t.Run("wrong client secret", func(t *testing.T) {
 		idp := newFakeIdP(t)
-		app, _ := newApp(t, idp, func(c *Config) { c.ClientSecret = "nope" })
-		res, _ := get(t, browser(t), app.URL+"/", nav)
-		if res.StatusCode != 502 {
-			t.Errorf("got %d", res.StatusCode)
+		idp.Start()
+		bad := oidcCfg(idp)
+		bad.ClientSecret = "nope"
+		app, _ := startApp(t, Config{OIDC: bad})
+		res, body := get(t, browser(), app.URL+"/", nav)
+		if res.Request.URL.Path != "/auth/login" || body == "hello app" {
+			t.Errorf("%d at %s", res.StatusCode, res.Request.URL)
+		}
+	})
+	t.Run("forged state and missing flow cookie", func(t *testing.T) {
+		idp := newFakeIdP(t)
+		idp.Start()
+		app, g := startApp(t, Config{OIDC: oidcCfg(idp)})
+		c := noRedirect(browser())
+		_, _ = get(t, c, app.URL+"/auth/oidc", nil)
+		res, _ := get(t, c, app.URL+"/auth/callback?code=x&state=forged", nil)
+		if res.StatusCode != 302 || !strings.HasPrefix(res.Header.Get("Location"), "/auth/login?error=failed") {
+			t.Errorf("forged state: %d %s", res.StatusCode, res.Header.Get("Location"))
+		}
+		res, _ = get(t, noRedirect(browser()), app.URL+"/auth/callback?code=x&state=y", nil)
+		if res.StatusCode != 302 || !strings.HasPrefix(res.Header.Get("Location"), "/auth/login?error=failed") {
+			t.Errorf("no flow cookie: %d %s", res.StatusCode, res.Header.Get("Location"))
+		}
+		u, _ := url.Parse(app.URL)
+		for _, ck := range c.Jar.Cookies(u) {
+			if ck.Name == g.sessionCookie {
+				t.Error("a rejected login must not set a session")
+			}
 		}
 	})
 	t.Run("flow cookie is not a session", func(t *testing.T) {
 		idp := newFakeIdP(t)
-		app, g := newApp(t, idp, nil)
-		c, _ := login(t, idp, app)
+		idp.Start()
+		app, g := startApp(t, Config{OIDC: oidcCfg(idp)})
+		c := noRedirect(browser())
+		_, _ = get(t, c, app.URL+"/auth/oidc", nil)
 		u, _ := url.Parse(app.URL)
 		for _, ck := range c.Jar.Cookies(&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/auth/"}) {
 			if ck.Name == g.flowCookie {
 				c.Jar.SetCookies(u, []*http.Cookie{{Name: g.sessionCookie, Value: ck.Value, Path: "/"}})
 			}
 		}
-		if res, _ := get(t, c, app.URL+"/", nil); res.StatusCode != 401 {
-			t.Errorf("flow cookie accepted as session: %d", res.StatusCode)
+		if res, _ := get(t, c, app.URL+"/api", nil); res.StatusCode != 401 {
+			t.Errorf("flow cookie accepted as a session: %d", res.StatusCode)
 		}
 	})
 }
 
-func TestAuthorizeRequestUsesPKCE(t *testing.T) {
+func TestOIDCSessionHoldsNoIdentity(t *testing.T) {
 	idp := newFakeIdP(t)
-	app, _ := newApp(t, idp, nil)
-	res, _ := get(t, noRedirect(browser(t)), app.URL+"/auth/login", nil)
-	loc, _ := url.Parse(res.Header.Get("Location"))
-	q := loc.Query()
-	if q.Get("code_challenge_method") != "S256" || q.Get("code_challenge") == "" ||
-		q.Get("state") == "" || q.Get("nonce") == "" ||
-		q.Get("redirect_uri") != app.URL+"/auth/callback" || q.Get("response_type") != "code" {
-		t.Errorf("bad authorize request: %v", q)
-	}
-	for _, s := range []string{"openid", "email"} {
-		if !strings.Contains(q.Get("scope"), s) {
-			t.Errorf("scope %q missing: %s", s, q.Get("scope"))
+	idp.Start()
+	app, g := startApp(t, Config{OIDC: oidcCfg(idp)})
+	c := browser()
+	_, _ = get(t, c, app.URL+"/", nav)
+	u, _ := url.Parse(app.URL)
+	for _, ck := range c.Jar.Cookies(u) {
+		if ck.Name == g.sessionCookie {
+			payload, _, _ := strings.Cut(ck.Value, ".")
+			b, _ := base64.RawURLEncoding.DecodeString(payload)
+			if strings.Contains(string(b), "a@example.com") || strings.Contains(string(b), "user-1") {
+				t.Errorf("identity leaked into the session cookie: %s", b)
+			}
+			return
 		}
 	}
+	t.Error("no session cookie after OIDC login")
 }
 
-func TestLogout(t *testing.T) {
-	idp := newFakeIdP(t)
-	app, _ := newApp(t, idp, nil)
-	c := browser(t)
-	if _, body := get(t, c, app.URL+"/", nav); !strings.HasPrefix(body, "hello") {
-		t.Fatalf("login failed: %q", body)
+func TestOIDCProviderDownAtStartup(t *testing.T) {
+	idp := newFakeIdP(t) // reserved but not started: unreachable
+	app, g := startApp(t, Config{OIDC: oidcCfg(idp), retryBase: 20 * time.Millisecond})
+
+	// No account yet: the page explains the provider is unreachable; no form to use.
+	res, body := get(t, browser(), app.URL+"/", nav)
+	if res.StatusCode != 200 || res.Request.URL.Path != "/auth/login" || !strings.Contains(body, "not reachable") || strings.Contains(body, "<form") {
+		t.Errorf("first launch, provider down: %d at %s: %.200s", res.StatusCode, res.Request.URL, body)
 	}
-	res, body := get(t, c, app.URL+"/auth/logout", nav)
-	if res.Request.URL.Path != "/auth/logged-out" || !strings.Contains(body, "signed out") {
-		t.Errorf("logout landing: %s %q", res.Request.URL.Path, body)
+	// With an account, the local login is the fallback.
+	_ = g.store.createAccount("alice", "correct horse")
+	c := signedIn(t, app, g)
+	if _, body := get(t, c, app.URL+"/", nav); body != "hello app" {
+		t.Errorf("local fallback while the provider is down: %q", body)
 	}
-	if res, _ := get(t, noRedirect(c), app.URL+"/api", nil); res.StatusCode != 401 {
-		t.Errorf("still signed in after logout: %d", res.StatusCode)
+	// The provider comes up; the gate notices and starts redirecting to it.
+	idp.Start()
+	deadline := time.Now().Add(5 * time.Second)
+	for g.oidcGet() == nil && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if g.oidcGet() == nil {
+		t.Fatal("the gate never picked up the provider")
+	}
+	if res, _ := get(t, noRedirect(browser()), app.URL+"/dash", nav); res.Header.Get("Location") != "/auth/oidc?next=%2Fdash" {
+		t.Errorf("after recovery expected an OIDC redirect, got %s", res.Header.Get("Location"))
 	}
 }
 
-func TestMe(t *testing.T) {
+func TestDisableBuiltInLoginIgnoredWithoutOIDC(t *testing.T) {
+	app, g := startApp(t, Config{DisableBuiltInLogin: true})
+	if !g.localEnabled() {
+		t.Fatal("the flag must not lock everyone out when OIDC is off")
+	}
+	_ = g.store.createAccount("alice", "correct horse")
+	c := signedIn(t, app, g)
+	if _, body := get(t, c, app.URL+"/", nav); body != "hello app" {
+		t.Errorf("%q", body)
+	}
+}
+
+// --- configuration -----------------------------------------------------
+
+func TestFromEnv(t *testing.T) {
+	ctx := context.Background()
+	opts := []Option{WithLogger(quiet)}
+	dir := func(t *testing.T) Option { return WithDataDir(t.TempDir()) }
+
+	t.Run("AUTH_DISABLED turns the gate off", func(t *testing.T) {
+		t.Setenv("MY_APP_AUTH_DISABLED", "true")
+		g, err := FromEnv(ctx, "my-app", opts...)
+		if g != nil || err != nil {
+			t.Fatalf("got %v, %v", g, err)
+		}
+		h := http.NewServeMux()
+		if g.Wrap(h) != http.Handler(h) {
+			t.Error("a nil gate must return the handler unchanged")
+		}
+	})
+	t.Run("on by default", func(t *testing.T) {
+		g, err := FromEnv(ctx, "my-app", append(opts, dir(t))...)
+		if err != nil || g == nil {
+			t.Fatalf("got %v, %v", g, err)
+		}
+		if g.oidcCfg != nil || !g.localEnabled() {
+			t.Error("default should be local account only")
+		}
+	})
+	t.Run("invalid booleans", func(t *testing.T) {
+		for _, name := range []string{"MY_APP_AUTH_DISABLED", "MY_APP_OIDC_ENABLED", "MY_APP_OIDC_DISABLE_BUILT_IN_LOGIN"} {
+			t.Run(name, func(t *testing.T) {
+				t.Setenv(name, "maybe")
+				if _, err := FromEnv(ctx, "my-app", append(opts, dir(t))...); err == nil {
+					t.Fatal("expected an error")
+				}
+			})
+		}
+	})
+	t.Run("OIDC enabled but incomplete refuses", func(t *testing.T) {
+		t.Setenv("MY_APP_OIDC_ENABLED", "true")
+		t.Setenv("MY_APP_OIDC_ISSUER", "https://auth.example.com")
+		_, err := FromEnv(ctx, "my-app", append(opts, dir(t))...)
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		for _, v := range []string{"MY_APP_OIDC_CLIENT_ID", "MY_APP_OIDC_CLIENT_SECRET", "MY_APP_OIDC_BASE_URL"} {
+			if !strings.Contains(err.Error(), v) {
+				t.Errorf("error should name %s: %v", v, err)
+			}
+		}
+	})
+	t.Run("an unreachable provider is not an error", func(t *testing.T) {
+		t.Setenv("MY_APP_OIDC_ENABLED", "true")
+		t.Setenv("MY_APP_OIDC_ISSUER", "http://127.0.0.1:1")
+		t.Setenv("MY_APP_OIDC_CLIENT_ID", "cid")
+		t.Setenv("MY_APP_OIDC_CLIENT_SECRET", "s")
+		t.Setenv("MY_APP_OIDC_BASE_URL", "http://localhost:8080")
+		cctx, cancel := context.WithCancel(ctx)
+		defer cancel() // stops the background retry
+		g, err := FromEnv(cctx, "my-app", append(opts, dir(t))...)
+		if err != nil || g == nil || g.oidcGet() != nil {
+			t.Fatalf("got %v, %v", g, err)
+		}
+	})
+	t.Run("complete OIDC config with public paths", func(t *testing.T) {
+		idp := newFakeIdP(t)
+		idp.Start()
+		t.Setenv("MY_APP_OIDC_ENABLED", "TRUE")
+		t.Setenv("MY_APP_OIDC_ISSUER", idp.URL)
+		t.Setenv("MY_APP_OIDC_CLIENT_ID", "cid")
+		t.Setenv("MY_APP_OIDC_CLIENT_SECRET", "csecret")
+		t.Setenv("MY_APP_OIDC_BASE_URL", "http://localhost:8080")
+		t.Setenv("MY_APP_OIDC_DISABLE_BUILT_IN_LOGIN", "true")
+		t.Setenv("MY_APP_AUTH_PUBLIC_PATHS", "/a, /b/")
+		g, err := FromEnv(ctx, "my-app", append(opts, dir(t), WithPublicPaths("/c"))...)
+		if err != nil || g == nil {
+			t.Fatalf("got %v, %v", g, err)
+		}
+		if g.oidcGet() == nil || g.localEnabled() {
+			t.Error("OIDC should be ready and local login disabled")
+		}
+		for _, p := range []string{"/healthz", "/a", "/b/x", "/c"} {
+			if !g.isPublic(p) {
+				t.Errorf("%s should be public", p)
+			}
+		}
+		if g.isPublic("/other") {
+			t.Error("/other should not be public")
+		}
+	})
+}
+
+func TestNewValidation(t *testing.T) {
 	idp := newFakeIdP(t)
-	app, _ := newApp(t, idp, nil)
-	c := browser(t)
-	fetch := map[string]string{"Sec-Fetch-Mode": "same-origin"}
+	idp.Start()
+	good := func() Config {
+		return Config{App: "a", DataDir: t.TempDir(), Logger: quiet, OIDC: &OIDCConfig{Issuer: idp.URL, ClientID: "c", ClientSecret: "s", BaseURL: "http://localhost:1"}}
+	}
+	for name, mutate := range map[string]func(*Config){
+		"base url with path": func(c *Config) { c.OIDC.BaseURL = "https://x.example.com/app" },
+		"base url relative":  func(c *Config) { c.OIDC.BaseURL = "x.example.com" },
+		"no client secret":   func(c *Config) { c.OIDC.ClientSecret = "" },
+		"no app":             func(c *Config) { c.App = "" },
+	} {
+		cfg := good()
+		mutate(&cfg)
+		if _, err := New(context.Background(), cfg); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+	if _, err := New(context.Background(), good()); err != nil {
+		t.Errorf("valid config rejected: %v", err)
+	}
+}
 
-	res, _ := get(t, noRedirect(browser(t)), app.URL+"/auth/me", fetch)
-	if res.StatusCode != 401 {
-		t.Errorf("signed out: got %d, want 401", res.StatusCode)
-	}
-
-	if _, body := get(t, c, app.URL+"/", nav); !strings.HasPrefix(body, "hello") {
-		t.Fatalf("login failed: %q", body)
-	}
-	res, body := get(t, c, app.URL+"/auth/me", fetch)
-	var me map[string]string
-	if err := json.Unmarshal([]byte(body), &me); err != nil || res.StatusCode != 200 {
-		t.Fatalf("signed in: %d %q (%v)", res.StatusCode, body, err)
-	}
-	if me["email"] != "a@example.com" || me["name"] != "Alice" || me["subject"] != "user-1" {
-		t.Errorf("unexpected user: %v", me)
-	}
-	if res.Header.Get("Cache-Control") != "no-store" {
-		t.Error("/auth/me must not be cached")
+func TestRedirectLocalNeverLeavesTheSite(t *testing.T) {
+	for in, want := range map[string]string{
+		"/ok?a=1":          "/ok?a=1",
+		"":                 "/",
+		"//evil.com":       "/",
+		"https://evil.com": "/",
+		"/\\evil.com":      "/",
+		"/a\r\nX: y":       "/",
+	} {
+		rec := httptest.NewRecorder()
+		redirectLocal(rec, httptest.NewRequest("GET", "/", nil), in)
+		if got := rec.Header().Get("Location"); got != want || rec.Code != 302 {
+			t.Errorf("redirectLocal(%q) -> %q (%d), want %q", in, got, rec.Code, want)
+		}
 	}
 }
 
@@ -426,110 +971,10 @@ func TestSafeNext(t *testing.T) {
 	}
 }
 
-func TestSecureCookieFollowsBaseURLScheme(t *testing.T) {
-	idp := newFakeIdP(t)
-	app, g := newApp(t, idp, nil)
-	if g.secure {
-		t.Error("http base URL should not set Secure")
-	}
-	_ = app
-	g2, err := New(context.Background(), Config{App: "a", Issuer: idp.URL, ClientID: "cid", ClientSecret: "s",
-		BaseURL: "https://app.example.com", SessionSecret: "0123456789abcdef",
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
-	if err != nil || !g2.secure {
-		t.Errorf("https base URL should set Secure (err=%v)", err)
-	}
-}
-
-func TestFromEnv(t *testing.T) {
-	idp := newFakeIdP(t)
-	quiet := WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
-	ctx := context.Background()
-
-	t.Run("disabled by default", func(t *testing.T) {
-		g, err := FromEnv(ctx, "my-app")
-		if g != nil || err != nil {
-			t.Fatalf("got %v, %v", g, err)
-		}
-		h := http.NewServeMux()
-		if g.Wrap(h) != http.Handler(h) {
-			t.Error("nil gate must return the handler unchanged")
-		}
-	})
-	t.Run("explicitly disabled", func(t *testing.T) {
-		t.Setenv("MY_APP_OIDC_ENABLED", "false")
-		if g, err := FromEnv(ctx, "my-app"); g != nil || err != nil {
-			t.Fatalf("got %v, %v", g, err)
-		}
-	})
-	t.Run("invalid enabled value", func(t *testing.T) {
-		t.Setenv("MY_APP_OIDC_ENABLED", "maybe")
-		if _, err := FromEnv(ctx, "my-app"); err == nil {
-			t.Fatal("expected error")
-		}
-	})
-	t.Run("enabled but incomplete refuses", func(t *testing.T) {
-		t.Setenv("MY_APP_OIDC_ENABLED", "true")
-		t.Setenv("MY_APP_OIDC_ISSUER", idp.URL)
-		_, err := FromEnv(ctx, "my-app", quiet)
-		if err == nil {
-			t.Fatal("expected error")
-		}
-		for _, v := range []string{"MY_APP_OIDC_CLIENT_ID", "MY_APP_OIDC_CLIENT_SECRET", "MY_APP_OIDC_BASE_URL"} {
-			if !strings.Contains(err.Error(), v) {
-				t.Errorf("error should name %s: %v", v, err)
-			}
-		}
-	})
-	t.Run("unreachable issuer refuses", func(t *testing.T) {
-		t.Setenv("MY_APP_OIDC_ENABLED", "true")
-		t.Setenv("MY_APP_OIDC_ISSUER", "http://127.0.0.1:1")
-		t.Setenv("MY_APP_OIDC_CLIENT_ID", "cid")
-		t.Setenv("MY_APP_OIDC_CLIENT_SECRET", "s")
-		t.Setenv("MY_APP_OIDC_BASE_URL", "http://localhost:8080")
-		if _, err := FromEnv(ctx, "my-app", quiet); err == nil {
-			t.Fatal("expected error")
-		}
-	})
-	t.Run("complete config works", func(t *testing.T) {
-		t.Setenv("MY_APP_OIDC_ENABLED", "TRUE")
-		t.Setenv("MY_APP_OIDC_ISSUER", idp.URL)
-		t.Setenv("MY_APP_OIDC_CLIENT_ID", "cid")
-		t.Setenv("MY_APP_OIDC_CLIENT_SECRET", "csecret")
-		t.Setenv("MY_APP_OIDC_BASE_URL", "http://localhost:8080")
-		t.Setenv("MY_APP_OIDC_PUBLIC_PATHS", "/a, /b/")
-		g, err := FromEnv(ctx, "my-app", quiet, WithPublicPaths("/c"))
-		if err != nil || g == nil {
-			t.Fatalf("got %v, %v", g, err)
-		}
-		for _, p := range []string{"/healthz", "/a", "/b/x", "/c"} {
-			if !g.isPublic(p) {
-				t.Errorf("%s should be public", p)
-			}
-		}
-		if g.isPublic("/other") {
-			t.Error("/other should not be public")
-		}
-	})
-}
-
-func TestNewValidation(t *testing.T) {
-	idp := newFakeIdP(t)
-	ok := Config{App: "a", Issuer: idp.URL, ClientID: "c", ClientSecret: "s", BaseURL: "http://localhost:1",
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	for name, mutate := range map[string]func(*Config){
-		"base url with path": func(c *Config) { c.BaseURL = "https://x.example.com/app" },
-		"base url relative":  func(c *Config) { c.BaseURL = "x.example.com" },
-		"short secret":       func(c *Config) { c.SessionSecret = "short" },
-		"no app":             func(c *Config) { c.App = "" },
-	} {
-		cfg := ok
-		mutate(&cfg)
-		if _, err := New(context.Background(), cfg); err == nil {
-			t.Errorf("%s: expected error", name)
-		}
-	}
-	if _, err := New(context.Background(), ok); err != nil {
-		t.Errorf("valid config rejected: %v", err)
+func TestLoggedOutPage(t *testing.T) {
+	app, _ := startApp(t, Config{})
+	res, body := get(t, noRedirect(browser()), app.URL+"/auth/logged-out", nil)
+	if res.StatusCode != 200 || !strings.Contains(body, "Sign in again") {
+		t.Errorf("%d %.100s", res.StatusCode, body)
 	}
 }
