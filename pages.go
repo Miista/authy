@@ -16,20 +16,21 @@ const clientJS = `document.documentElement.dataset.oidcgate="on";window.oidcgate
 
 // pageData drives the single template behind every gate page.
 type pageData struct {
-	App       string
-	Title     string
-	Heading   string
-	Error     string
-	Message   string
-	Next      string
-	CSRF      string
-	ShowForm  bool // local sign-in form
-	ShowSetup bool // create-account form
-	ShowOIDC  bool
-	OIDCURL   string
-	OIDCLabel string
-	Link      string // optional trailing link, e.g. "Sign in again"
-	LinkLabel string
+	App        string
+	Title      string
+	Heading    string
+	Error      string
+	Message    string
+	Next       string
+	CSRF       string
+	ShowForm   bool // local sign-in form
+	ShowSetup  bool // create-account form
+	ShowLogout bool // sign-out confirmation form
+	ShowOIDC   bool
+	OIDCURL    string
+	OIDCLabel  string
+	Link       string // optional trailing link, e.g. "Sign in again"
+	LinkLabel  string
 }
 
 var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
@@ -89,6 +90,12 @@ label,.app,.or{color:#5b5f73}.or:before,.or:after{border-color:#c9ccdb}
 <label for="p">Password</label>
 <input id="p" name="password" type="password" autocomplete="current-password" required maxlength="72">
 <button type="submit">Sign in</button>
+</form>
+{{end}}
+{{if .ShowLogout}}
+<form method="post" action="/auth/logout">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<button type="submit">Sign out</button>
 </form>
 {{end}}
 {{if .ShowOIDC}}{{if or .ShowForm .ShowSetup}}<div class="or">or</div>{{end}}

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
@@ -33,6 +34,10 @@ type storeData struct {
 	Username     string `json:"username,omitempty"`
 	PasswordHash string `json:"password_hash,omitempty"`
 	SessionKey   string `json:"session_key"` // base64; signs session cookies
+	// Revoked are signed-out session IDs and when each may be forgotten (the
+	// session's absolute end, as a Unix time). Persisted so a sign-out holds
+	// across restarts; pruned on every revocation.
+	Revoked map[string]int64 `json:"revoked,omitempty"`
 }
 
 // store holds the single local account and the key that signs sessions.
@@ -91,6 +96,32 @@ func (s *store) sessionKey() []byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.key
+}
+
+// revoke remembers that a session may no longer be used, until keepUntil (when
+// the cookie could not be valid any more regardless). Expired entries are
+// pruned here, so the list only ever holds live sign-outs.
+func (s *store) revoke(sid string, keepUntil int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().Unix()
+	for id, e := range s.data.Revoked {
+		if e <= now {
+			delete(s.data.Revoked, id)
+		}
+	}
+	if s.data.Revoked == nil {
+		s.data.Revoked = map[string]int64{}
+	}
+	s.data.Revoked[sid] = keepUntil
+	return s.saveLocked()
+}
+
+func (s *store) isRevoked(sid string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	exp, ok := s.data.Revoked[sid]
+	return ok && exp > time.Now().Unix()
 }
 
 // createAccount stores the single account. It fails if one already exists, so

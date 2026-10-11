@@ -133,6 +133,8 @@ in the app's existing `/app/data` volume, must be writable by the app's user
 (startup fails with a clear message if not), and can't be moved. Sessions are
 signed `HttpOnly`, `SameSite=Lax` cookies (`Secure` over HTTPS or
 `X-Forwarded-Proto: https`) with a sliding 7-day life, and survive restarts.
+However often a session is renewed, it ends for good four lifetimes (28 days)
+after sign-in.
 
 **Forgot the password?** Stop the app, delete `auth.json`, start it again; the
 setup page returns. There is no password-change page.
@@ -148,6 +150,9 @@ only announces itself:
 
 <a class="only-with-gate" href="/auth/logout">Sign out</a>
 ```
+
+The link opens a confirmation page; the actual sign-out is a POST with a CSRF
+token, so another site can't sign your users out with a crafted link.
 
 `/auth/client.js` sets `document.documentElement.dataset.oidcgate = "on"`. With
 the gate off it is a 404, the attribute never appears, and everything marked
@@ -172,10 +177,11 @@ One local account, no password change; `BASE_URL` can't contain a path; each
 host needs its own IdP client; it answers "who is signed in, and in which
 groups?", and leaves what each may do to the app.
 
-Sessions are stateless cookies, so **logout clears this browser's cookie but
-can't revoke a copy of it**; a stolen cookie lives until it expires (7 days,
-sliding). To end every session, stop the app, delete `auth.json` (which also
-removes the account) and start it again.
+Sessions are stateless cookies with a signed session ID. Signing out revokes
+that ID (persisted in `auth.json`), so **every copy of the cookie dies with the
+sign-out**, and no session outlives four lifetimes (28 days) after sign-in no
+matter how often it is renewed. To end every session at once, stop the app,
+delete `auth.json` (which also removes the account) and start it again.
 
 ## Testing
 

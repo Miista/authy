@@ -621,6 +621,12 @@ func (g *Gate) oidcUser(ctx context.Context, s *oidcState, tok *oauth2.Token, id
 		c.Groups = fromInfo.Groups
 	}
 
+	// "local:" is the built-in account's namespace (see localUser). A provider
+	// subject inside it would collide with the local admin for any app keying
+	// on User.Subject, so it is refused rather than passed through.
+	if strings.HasPrefix(idToken.Subject, "local:") {
+		return nil, errors.New(`the id_token subject starts with "local:", which is reserved for the built-in account`)
+	}
 	name := c.PreferredUsername
 	if name == "" {
 		name = c.Name
@@ -645,10 +651,39 @@ func (g *Gate) loginFail(w http.ResponseWriter, r *http.Request, code, next, det
 
 // --- logout --------------------------------------------------------------
 
+// handleLogout signs out only on a POST that passes the CSRF check: a GET shows
+// a confirmation page instead, so a third-party page cannot sign the user out
+// by making the browser follow a link.
 func (g *Gate) handleLogout(w http.ResponseWriter, r *http.Request) {
-	g.clearCookie(w, r, g.sessionCookie, "/")
-	w.Header().Set("Cache-Control", "no-store")
-	http.Redirect(w, r, loggedOutPath, http.StatusFound)
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		g.showLogout(w, r, http.StatusOK, "")
+	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 4096)
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if !g.checkCSRF(r) {
+			g.showLogout(w, r, http.StatusForbidden, "Your session expired. Please try again.")
+			return
+		}
+		g.endSession(w, r)
+		w.Header().Set("Cache-Control", "no-store")
+		http.Redirect(w, r, loggedOutPath, http.StatusFound)
+	default:
+		w.Header().Set("Allow", "GET, HEAD, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (g *Gate) showLogout(w http.ResponseWriter, r *http.Request, status int, msg string) {
+	g.render(w, status, pageData{
+		Title: "Sign out", Heading: "Sign out",
+		Message: "Do you want to sign out?", Error: msg,
+		ShowLogout: true, CSRF: g.csrfToken(w, r),
+		Link: "/", LinkLabel: "Cancel",
+	})
 }
 
 // handleLoggedOut shows a landing page rather than bouncing straight back into

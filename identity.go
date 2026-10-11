@@ -14,7 +14,8 @@ import (
 // identity provider.
 type User struct {
 	// Subject is the provider's stable ID for the person (the "sub" claim). For
-	// the local account it is "local:" plus the username.
+	// the local account it is "local:" plus the username; an OIDC subject in
+	// that namespace is refused at sign-in, so the two can never collide.
 	Subject string
 	// Name is the person's username if the provider gave one, else their name,
 	// else their email, else the subject. It is for display and logs; it is not

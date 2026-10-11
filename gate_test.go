@@ -422,12 +422,75 @@ func TestLoginLogoutAndRateLimit(t *testing.T) {
 		t.Fatalf("login: %d %q at %s", res.StatusCode, body, res.Request.URL.Path)
 	}
 
+	// A GET must only confirm, never sign out (logout CSRF).
 	res, body = get(t, c, app.URL+"/auth/logout", nav)
-	if res.Request.URL.Path != "/auth/logged-out" || !strings.Contains(body, "signed out") {
-		t.Errorf("logout landing: %s %.100s", res.Request.URL.Path, body)
+	if res.Request.URL.Path != "/auth/logout" || !strings.Contains(body, `action="/auth/logout"`) {
+		t.Errorf("GET logout should show a confirmation page: %s %.100s", res.Request.URL.Path, body)
+	}
+	if res, _ := get(t, noRedirect(c), app.URL+"/api", nil); res.StatusCode != 200 {
+		t.Errorf("GET logout must not sign out: %d", res.StatusCode)
+	}
+	// c no longer follows redirects (noRedirect mutated it above).
+	if res, _ := do(t, c, "POST", app.URL+"/auth/logout", url.Values{"csrf": {"forged"}}, nil); res.StatusCode != 403 {
+		t.Errorf("logout with a bad CSRF token accepted: %d", res.StatusCode)
+	}
+	if res, _ := get(t, c, app.URL+"/api", nil); res.StatusCode != 200 {
+		t.Errorf("a refused logout must not sign out: %d", res.StatusCode)
+	}
+	res, _ = do(t, c, "POST", app.URL+"/auth/logout", url.Values{"csrf": {formToken(t, c, app.URL+"/auth/logout")}}, nil)
+	if res.StatusCode != 302 || res.Header.Get("Location") != "/auth/logged-out" {
+		t.Errorf("logout landing: %d %s", res.StatusCode, res.Header.Get("Location"))
 	}
 	if res, _ := get(t, noRedirect(c), app.URL+"/api", nil); res.StatusCode != 401 {
 		t.Errorf("still signed in after logout: %d", res.StatusCode)
+	}
+}
+
+func TestLogoutRevokesEveryCopyOfTheSession(t *testing.T) {
+	app, g := startApp(t, Config{})
+	_ = g.store.createAccount("alice", "correct horse")
+	c := browser()
+	tok := formToken(t, c, app.URL+"/auth/login")
+	if res, _ := do(t, c, "POST", app.URL+"/auth/login", url.Values{"username": {"alice"}, "password": {"correct horse"}, "csrf": {tok}}, nil); res.StatusCode != 200 {
+		t.Fatalf("login: %d", res.StatusCode)
+	}
+
+	// An attacker steals a copy of the session cookie before the user signs out.
+	appURL, _ := url.Parse(app.URL)
+	var stolen *http.Cookie
+	for _, ck := range c.Jar.Cookies(appURL) {
+		if ck.Name == g.sessionCookie {
+			stolen = ck
+		}
+	}
+	if stolen == nil {
+		t.Fatal("no session cookie to steal")
+	}
+
+	if res, _ := do(t, c, "POST", app.URL+"/auth/logout", url.Values{"csrf": {formToken(t, c, app.URL+"/auth/logout")}}, nil); res.Request.URL.Path != "/auth/logged-out" {
+		t.Fatalf("logout landed at %s", res.Request.URL.Path)
+	}
+
+	thief := noRedirect(browser())
+	thief.Jar.SetCookies(appURL, []*http.Cookie{stolen})
+	if res, _ := get(t, thief, app.URL+"/api", nil); res.StatusCode != 401 {
+		t.Errorf("a stolen cookie must die with the sign-out: %d", res.StatusCode)
+	}
+}
+
+func TestSessionsEndAtTheAbsoluteCap(t *testing.T) {
+	app, g := startApp(t, Config{})
+	_ = g.store.createAccount("alice", "correct horse")
+	c := noRedirect(browser())
+
+	// A session created maxSessionFactor×TTL ago is dead even with a fresh Exp,
+	// so sliding renewal cannot keep one sign-in alive forever.
+	old := time.Now().Add(-time.Duration(maxSessionFactor)*g.ttl - time.Hour)
+	claims := sessionClaims{Exp: time.Now().Add(g.ttl).Unix(), Iat: old.Unix(), SID: randString(), U: localUser("alice")}
+	appURL, _ := url.Parse(app.URL)
+	c.Jar.SetCookies(appURL, []*http.Cookie{{Name: g.sessionCookie, Value: g.seal(purposeSession, claims)}})
+	if res, _ := get(t, c, app.URL+"/api", nil); res.StatusCode != 401 {
+		t.Errorf("a session past the absolute cap must be rejected: %d", res.StatusCode)
 	}
 }
 
@@ -722,7 +785,8 @@ func TestOIDCLocalLoginEscapeHatch(t *testing.T) {
 
 func TestOIDCRejections(t *testing.T) {
 	cases := map[string]func(*fakeIdP){
-		"nonce mismatch": func(f *fakeIdP) { f.badNonce = true },
+		"nonce mismatch":                 func(f *fakeIdP) { f.badNonce = true },
+		"subject in the local namespace": func(f *fakeIdP) { f.idClaims = map[string]any{"sub": "local:alice"} },
 	}
 	for name, setup := range cases {
 		t.Run(name, func(t *testing.T) {

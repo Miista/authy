@@ -13,11 +13,15 @@ import (
 	"time"
 )
 
-// sessionClaims is the payload of the session cookie: when it ends and who it
-// is for. A session from before identities were recorded has no U and is still
-// valid, so an app that does not use UserFrom is unaffected by an upgrade.
+// sessionClaims is the payload of the session cookie: when it ends, when it was
+// created, its ID (so sign-out can revoke it) and who it is for. A session from
+// before identities were recorded has no U and is still valid, so an app that
+// does not use UserFrom is unaffected by an upgrade; one from before Iat/SID
+// existed is stamped with both at its next renewal.
 type sessionClaims struct {
 	Exp int64        `json:"exp"`
+	Iat int64        `json:"iat,omitempty"`
+	SID string       `json:"sid,omitempty"`
 	U   *sessionUser `json:"u,omitempty"`
 }
 
@@ -35,6 +39,11 @@ const (
 	purposeSession = "session"
 	purposeFlow    = "flow"
 	flowTTL        = 10 * time.Minute
+
+	// maxSessionFactor caps what sliding renewal can add up to: a session ends
+	// for good maxSessionFactor×TTL after sign-in, no matter how often it is
+	// refreshed, so a stolen cookie cannot be kept alive forever.
+	maxSessionFactor = 4
 )
 
 // seal serialises v and appends an HMAC bound to purpose, so a flow cookie can
@@ -92,14 +101,17 @@ func (g *Gate) clearCookie(w http.ResponseWriter, r *http.Request, name, path st
 }
 
 func (g *Gate) startSession(w http.ResponseWriter, r *http.Request, u *sessionUser) {
-	c := sessionClaims{Exp: time.Now().Add(g.ttl).Unix(), U: u}
+	now := time.Now()
+	c := sessionClaims{Exp: now.Add(g.ttl).Unix(), Iat: now.Unix(), SID: randString(), U: u}
 	g.setCookie(w, r, g.sessionCookie, g.seal(purposeSession, c), "/", g.ttl)
 }
 
-// session reports whether the request carries a valid, unexpired session, and
-// who it is for, if the session says. It re-issues the cookie once less than
-// half its lifetime remains (sliding expiry), keeping the same identity: the
-// groups are those from sign-in, so they are as old as the sign-in is.
+// session reports whether the request carries a valid, unexpired, unrevoked
+// session, and who it is for, if the session says. It re-issues the cookie once
+// less than half its lifetime remains (sliding expiry), keeping the same
+// identity, sign-in time and ID: the groups are those from sign-in, so they are
+// as old as the sign-in is, and the whole session ends at maxSessionFactor×TTL
+// after sign-in however often it is renewed.
 func (g *Gate) session(w http.ResponseWriter, r *http.Request) (*sessionUser, bool) {
 	ck, err := r.Cookie(g.sessionCookie)
 	if err != nil {
@@ -109,14 +121,49 @@ func (g *Gate) session(w http.ResponseWriter, r *http.Request) (*sessionUser, bo
 	if !g.open(purposeSession, ck.Value, &c) {
 		return nil, false
 	}
-	remaining := time.Until(time.Unix(c.Exp, 0))
+	now := time.Now()
+	remaining := time.Unix(c.Exp, 0).Sub(now)
 	if remaining <= 0 {
 		return nil, false
 	}
+	if c.Iat > 0 && now.After(time.Unix(c.Iat, 0).Add(maxSessionFactor*g.ttl)) {
+		return nil, false
+	}
+	if c.SID != "" && g.store.isRevoked(c.SID) {
+		return nil, false
+	}
 	if remaining < g.ttl/2 {
-		g.startSession(w, r, c.U)
+		// A pre-upgrade session has no sign-in time or ID; stamp both here, so
+		// the absolute cap and sign-out apply to it from now on.
+		if c.Iat == 0 {
+			c.Iat = now.Unix()
+		}
+		if c.SID == "" {
+			c.SID = randString()
+		}
+		c.Exp = now.Add(g.ttl).Unix()
+		g.setCookie(w, r, g.sessionCookie, g.seal(purposeSession, c), "/", g.ttl)
 	}
 	return c.U, true
+}
+
+// endSession revokes the request's session, so sign-out also kills every copy
+// of the cookie, and clears it from the browser. The revocation is kept until
+// the session would have hit its absolute cap anyway.
+func (g *Gate) endSession(w http.ResponseWriter, r *http.Request) {
+	if ck, err := r.Cookie(g.sessionCookie); err == nil {
+		var c sessionClaims
+		if g.open(purposeSession, ck.Value, &c) && c.SID != "" {
+			keep := c.Exp
+			if c.Iat > 0 {
+				keep = c.Iat + int64(maxSessionFactor*g.ttl/time.Second)
+			}
+			if err := g.store.revoke(c.SID, keep); err != nil {
+				g.log.Error("auth: recording the sign-out", "err", err)
+			}
+		}
+	}
+	g.clearCookie(w, r, g.sessionCookie, "/")
 }
 
 // csrfToken returns the double-submit token for the login and setup forms,
