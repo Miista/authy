@@ -11,7 +11,8 @@
 //
 // Who may sign in through OIDC is decided at the identity provider; the gate
 // only verifies that the provider authenticated the user for this client, and
-// records that the browser is authorized. It stores no identity.
+// records that the browser is authorized and who it is. An app that needs to tell
+// people apart reads that with UserFrom; one that does not never sees it.
 package oidcgate
 
 import (
@@ -69,6 +70,7 @@ type Gate struct {
 type oidcState struct {
 	oauth    *oauth2.Config
 	verifier *oidc.IDTokenVerifier
+	provider *oidc.Provider
 }
 
 // New validates cfg, opens the store (failing if its directory is not
@@ -160,11 +162,9 @@ func (g *Gate) discover(ctx context.Context, timeout time.Duration) error {
 	if err != nil {
 		return err
 	}
-	scopes := g.oidcCfg.Scopes
-	if len(scopes) == 0 {
-		scopes = []string{oidc.ScopeOpenID, "profile", "email"}
-	}
+	scopes := scopesOrDefault(g.oidcCfg.Scopes)
 	s := &oidcState{
+		provider: provider,
 		oauth: &oauth2.Config{
 			ClientID:     g.oidcCfg.ClientID,
 			ClientSecret: g.oidcCfg.ClientSecret,
@@ -229,7 +229,14 @@ func (g *Gate) Wrap(next http.Handler) http.Handler {
 			g.handleLoggedOut(w, r)
 			return
 		}
-		if g.isPublic(r.URL.Path) || g.session(w, r) {
+		if g.isPublic(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if u, ok := g.session(w, r); ok {
+			if u != nil {
+				r = withUser(r, u.user())
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -399,7 +406,7 @@ func (g *Gate) postLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	g.lim.reset()
-	g.startSession(w, r)
+	g.startSession(w, r, localUser(r.PostFormValue("username")))
 	g.log.Info("auth: local login ok")
 	redirectLocal(w, r, next)
 }
@@ -463,7 +470,7 @@ func (g *Gate) postSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	g.log.Info("auth: local account created")
-	g.startSession(w, r) // the key was rotated by createAccount, so this cookie is the only valid one
+	g.startSession(w, r, localUser(username)) // the key was rotated by createAccount, so this cookie is the only valid one
 	redirectLocal(w, r, next)
 }
 
@@ -552,9 +559,80 @@ func (g *Gate) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	g.startSession(w, r) // no identity is stored: the IdP decided who may sign in
+	u, err := g.oidcUser(r.Context(), s, tok, idToken)
+	if err != nil {
+		g.loginFail(w, r, "failed", next, "reading the user's claims: "+err.Error())
+		return
+	}
+	g.startSession(w, r, u)
 	g.log.Info("auth: oidc login ok", "sub", idToken.Subject)
 	redirectLocal(w, r, next)
+}
+
+// oidcClaims are the claims the gate reads, from the ID token or UserInfo.
+type oidcClaims struct {
+	PreferredUsername string   `json:"preferred_username"`
+	Name              string   `json:"name"`
+	Email             string   `json:"email"`
+	Groups            []string `json:"groups"`
+	hasGroups         bool
+}
+
+// oidcUser builds the signed-in user. Some providers (Authelia by default)
+// serve the profile and groups only from the UserInfo endpoint, so when groups
+// were asked for and the ID token has none, UserInfo is asked too. It is not
+// optional then: an app that asked for groups decides who may do what by them,
+// so a login whose groups cannot be read fails rather than carry on without
+// them. A user with no groups at all is fine, and is told apart from "could not
+// ask" by the call succeeding.
+func (g *Gate) oidcUser(ctx context.Context, s *oidcState, tok *oauth2.Token, idToken *oidc.IDToken) (*sessionUser, error) {
+	var c oidcClaims
+	if err := idToken.Claims(&c); err != nil {
+		return nil, err
+	}
+	var raw map[string]any
+	if err := idToken.Claims(&raw); err != nil {
+		return nil, err
+	}
+	_, c.hasGroups = raw["groups"]
+
+	if wantsGroups(g.oidcCfg.Scopes) && !c.hasGroups {
+		ui, err := s.provider.UserInfo(ctx, oauth2.StaticTokenSource(tok))
+		if err != nil {
+			return nil, fmt.Errorf("userinfo: %w", err)
+		}
+		if ui.Subject != idToken.Subject {
+			return nil, errors.New("userinfo is for a different subject than the id_token")
+		}
+		var fromInfo oidcClaims
+		if err := ui.Claims(&fromInfo); err != nil {
+			return nil, err
+		}
+		// The ID token's own values win; UserInfo fills what it lacks.
+		if c.PreferredUsername == "" {
+			c.PreferredUsername = fromInfo.PreferredUsername
+		}
+		if c.Name == "" {
+			c.Name = fromInfo.Name
+		}
+		if c.Email == "" {
+			c.Email = fromInfo.Email
+		}
+		c.Groups = fromInfo.Groups
+	}
+
+	name := c.PreferredUsername
+	if name == "" {
+		name = c.Name
+	}
+	u := newSessionUser(idToken.Subject, name, c.Email, c.Groups, false)
+	if u == nil {
+		return nil, errors.New("the id_token has no subject")
+	}
+	if len(c.Groups) > len(u.Groups) {
+		g.log.Warn("auth: some groups were dropped (too many or too long)", "sub", idToken.Subject, "sent", len(c.Groups), "kept", len(u.Groups))
+	}
+	return u, nil
 }
 
 // loginFail logs the detail and sends the browser to the sign-in page with a

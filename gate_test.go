@@ -51,6 +51,12 @@ type fakeIdP struct {
 	nonce     map[string]string // code -> nonce
 	badNonce  bool              // return a wrong nonce in the id_token
 	denyLogin bool              // authorize returns access_denied
+
+	idClaims     map[string]any // extra claims in the id_token
+	userinfo     map[string]any // served by /userinfo; nil: the endpoint answers 404
+	userinfoSub  string         // the "sub" /userinfo reports; default user-1
+	scopes       []string       // the scope parameter of the last authorize request
+	userinfoHits int
 }
 
 // newFakeIdP reserves an address; Start brings it up. Splitting them lets a
@@ -76,6 +82,7 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 			"authorization_endpoint":                f.URL + "/authorize",
 			"token_endpoint":                        f.URL + "/token",
 			"jwks_uri":                              f.URL + "/jwks",
+			"userinfo_endpoint":                     f.URL + "/userinfo",
 			"id_token_signing_alg_values_supported": []string{"RS256"},
 		})
 	})
@@ -91,6 +98,7 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 		rq := redirect.Query()
 		rq.Set("state", q.Get("state"))
 		f.mu.Lock()
+		f.scopes = strings.Fields(q.Get("scope"))
 		if f.denyLogin {
 			rq.Set("error", "access_denied")
 		} else {
@@ -132,20 +140,55 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 			Audience: jwt.Audience{"cid"},
 			Expiry:   jwt.NewNumericDate(time.Now().Add(time.Hour)),
 			IssuedAt: jwt.NewNumericDate(time.Now()),
-		}).Claims(map[string]any{"nonce": nonce, "email": "a@example.com"}).Serialize()
+		}).Claims(f.tokenClaims(nonce)).Serialize()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"access_token": "at", "token_type": "Bearer", "id_token": raw})
 	})
 	return f
 }
 
-func (f *fakeIdP) Start() { go http.Serve(f.l, f.mux) }
+// tokenClaims are the id_token's claims beyond the standard ones. Callers hold f.mu.
+func (f *fakeIdP) tokenClaims(nonce string) map[string]any {
+	m := map[string]any{"nonce": nonce, "email": "a@example.com"}
+	for k, v := range f.idClaims {
+		m[k] = v
+	}
+	return m
+}
+
+func (f *fakeIdP) Start() {
+	f.mux.HandleFunc("/userinfo", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.userinfoHits++
+		if f.userinfo == nil || r.Header.Get("Authorization") != "Bearer at" {
+			http.Error(w, `{"error":"invalid_token"}`, http.StatusUnauthorized)
+			return
+		}
+		sub := f.userinfoSub
+		if sub == "" {
+			sub = "user-1"
+		}
+		m := map[string]any{"sub": sub}
+		for k, v := range f.userinfo {
+			m[k] = v
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(m)
+	})
+	go http.Serve(f.l, f.mux)
+}
 
 // --- app harness -------------------------------------------------------
 
 var inner = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" {
 		io.WriteString(w, "ok")
+		return
+	}
+	if r.URL.Path == "/whoami" {
+		u, ok := UserFrom(r)
+		json.NewEncoder(w).Encode(map[string]any{"ok": ok, "user": u})
 		return
 	}
 	io.WriteString(w, "hello app")
@@ -455,25 +498,6 @@ func TestSlidingSessionRefresh(t *testing.T) {
 	}
 }
 
-func TestSessionCarriesNoIdentity(t *testing.T) {
-	app, g := startApp(t, Config{})
-	c := signedIn(t, app, g)
-	u, _ := url.Parse(app.URL)
-	var raw string
-	for _, ck := range c.Jar.Cookies(u) {
-		if ck.Name == g.sessionCookie {
-			raw = ck.Value
-		}
-	}
-	payload, _, _ := strings.Cut(raw, ".")
-	b, _ := base64.RawURLEncoding.DecodeString(payload)
-	var m map[string]any
-	_ = json.Unmarshal(b, &m)
-	if len(m) != 1 || m["exp"] == nil {
-		t.Errorf("session payload should be only an expiry, got %v", m)
-	}
-}
-
 func TestCreatingTheAccountEndsEarlierSessions(t *testing.T) {
 	app, g := startApp(t, Config{})
 	old := g.seal(purposeSession, sessionClaims{Exp: time.Now().Add(time.Hour).Unix()}) // e.g. from an earlier OIDC-only period
@@ -760,26 +784,6 @@ func TestOIDCRejections(t *testing.T) {
 			t.Errorf("flow cookie accepted as a session: %d", res.StatusCode)
 		}
 	})
-}
-
-func TestOIDCSessionHoldsNoIdentity(t *testing.T) {
-	idp := newFakeIdP(t)
-	idp.Start()
-	app, g := startApp(t, Config{OIDC: oidcCfg(idp)})
-	c := browser()
-	_, _ = get(t, c, app.URL+"/", nav)
-	u, _ := url.Parse(app.URL)
-	for _, ck := range c.Jar.Cookies(u) {
-		if ck.Name == g.sessionCookie {
-			payload, _, _ := strings.Cut(ck.Value, ".")
-			b, _ := base64.RawURLEncoding.DecodeString(payload)
-			if strings.Contains(string(b), "a@example.com") || strings.Contains(string(b), "user-1") {
-				t.Errorf("identity leaked into the session cookie: %s", b)
-			}
-			return
-		}
-	}
-	t.Error("no session cookie after OIDC login")
 }
 
 func TestOIDCProviderDownAtStartup(t *testing.T) {

@@ -13,10 +13,12 @@ import (
 	"time"
 )
 
-// sessionClaims is the payload of the session cookie. It deliberately carries
-// no identity: the gate only records that this browser was authorized.
+// sessionClaims is the payload of the session cookie: when it ends and who it
+// is for. A session from before identities were recorded has no U and is still
+// valid, so an app that does not use UserFrom is unaffected by an upgrade.
 type sessionClaims struct {
-	Exp int64 `json:"exp"`
+	Exp int64        `json:"exp"`
+	U   *sessionUser `json:"u,omitempty"`
 }
 
 // flowClaims is the payload of the short-lived cookie carrying one OIDC login
@@ -89,31 +91,32 @@ func (g *Gate) clearCookie(w http.ResponseWriter, r *http.Request, name, path st
 	})
 }
 
-func (g *Gate) startSession(w http.ResponseWriter, r *http.Request) {
-	c := sessionClaims{Exp: time.Now().Add(g.ttl).Unix()}
+func (g *Gate) startSession(w http.ResponseWriter, r *http.Request, u *sessionUser) {
+	c := sessionClaims{Exp: time.Now().Add(g.ttl).Unix(), U: u}
 	g.setCookie(w, r, g.sessionCookie, g.seal(purposeSession, c), "/", g.ttl)
 }
 
 // session reports whether the request carries a valid, unexpired session, and
-// re-issues the cookie once less than half its lifetime remains (sliding
-// expiry).
-func (g *Gate) session(w http.ResponseWriter, r *http.Request) bool {
+// who it is for, if the session says. It re-issues the cookie once less than
+// half its lifetime remains (sliding expiry), keeping the same identity: the
+// groups are those from sign-in, so they are as old as the sign-in is.
+func (g *Gate) session(w http.ResponseWriter, r *http.Request) (*sessionUser, bool) {
 	ck, err := r.Cookie(g.sessionCookie)
 	if err != nil {
-		return false
+		return nil, false
 	}
 	var c sessionClaims
 	if !g.open(purposeSession, ck.Value, &c) {
-		return false
+		return nil, false
 	}
 	remaining := time.Until(time.Unix(c.Exp, 0))
 	if remaining <= 0 {
-		return false
+		return nil, false
 	}
 	if remaining < g.ttl/2 {
-		g.startSession(w, r)
+		g.startSession(w, r, c.U)
 	}
-	return true
+	return c.U, true
 }
 
 // csrfToken returns the double-submit token for the login and setup forms,

@@ -72,6 +72,20 @@ func WithPublicPaths(paths ...string) Option {
 // WithSessionTTL overrides the session lifetime.
 func WithSessionTTL(d time.Duration) Option { return func(c *Config) { c.SessionTTL = d } }
 
+// WithScopes sets the scopes requested from the identity provider, for an app
+// that needs more than the default "openid profile email": add "groups" to be
+// told the user's groups (see User.Groups). "openid" is always requested. It has
+// no effect without OIDC. It is an option, not an environment variable, because
+// which scopes an app needs is a property of its code, not of a deployment; the
+// provider must also allow them for this client.
+func WithScopes(scopes ...string) Option {
+	return func(c *Config) {
+		if c.OIDC != nil {
+			c.OIDC.Scopes = append([]string(nil), scopes...)
+		}
+	}
+}
+
 // WithLogger sets the logger. Default: slog.Default().
 func WithLogger(l *slog.Logger) Option { return func(c *Config) { c.Logger = l } }
 

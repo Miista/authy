@@ -83,10 +83,47 @@ flowchart TD
 Missing OIDC settings or a malformed boolean make `FromEnv` return an error.
 
 **At the IdP:** register a confidential client with redirect URI
-`<BASE_URL>/auth/callback` (logged at startup), scopes `openid profile email`,
-and `client_secret_basic`. PKCE `S256` is always used. **Who may sign in is
-decided at the IdP**; the gate stores no identity, only that a browser is
-authorized.
+`<BASE_URL>/auth/callback` (logged at startup), scopes `openid profile email`
+(plus `groups` if the app asks for it, see below), and `client_secret_basic`.
+PKCE `S256` is always used. **Who may sign in is decided at the IdP**; the gate
+checks the sign-in and records that the browser is authorized and who it is.
+
+## Knowing who is signed in
+
+An app that needs to tell people apart (roles, per-user records) asks the gate:
+
+```go
+gate, err := oidcgate.FromEnv(ctx, "myapp", oidcgate.WithScopes("openid", "profile", "email", "groups"))
+// ...
+func handler(w http.ResponseWriter, r *http.Request) {
+	u, ok := oidcgate.UserFrom(r)
+	if !ok { /* nobody: treat as signed out */ }
+	if u.InGroup("admins") { /* ... */ }
+}
+```
+
+`User` has `Subject` (the IdP's stable `sub`, or `local:<username>` for the local
+account), `Name` (for display, not an identifier), `Email`, `Groups` and `Local`.
+
+- `WithScopes` is an option, not an environment variable: which scopes an app
+  needs belongs to its code, not to a deployment. `openid` is always requested.
+  The IdP has to allow them for the client too.
+- **Groups need the `groups` scope.** Some providers (Authelia by default)
+  serve them from the UserInfo endpoint rather than in the ID token; the gate
+  asks UserInfo when groups were requested and the ID token has none. If groups
+  were asked for and cannot be read (UserInfo fails, or answers for a different
+  subject), **the sign-in fails**: an app that decides by groups must not get a
+  user whose groups are unknown. A user with no groups at all signs in normally.
+- The identity lives in the signed session cookie, so it is as old as the
+  sign-in. **A change of group at the IdP takes effect at the next sign-in**,
+  which with a sliding session can be days; set `WithSessionTTL` to the staleness
+  you can accept.
+- Values are cleaned first (control characters stripped, at most 32 groups of 64
+  bytes each, a longer value is dropped whole, never cut). A dropped group can
+  only take access away. A subject is required.
+- `UserFrom` reports `false` on a public path, with the gate off, and for a
+  session from before this existed. Those sessions stay valid, so an app that
+  does not use identities is unaffected by upgrading.
 
 ## State
 
@@ -132,8 +169,8 @@ This is security-critical code. It is tested (`-race`) and scanned (`gosec`,
 ## Limits
 
 One local account, no password change; `BASE_URL` can't contain a path; each
-host needs its own IdP client; it answers "is this browser signed in?", nothing
-finer.
+host needs its own IdP client; it answers "who is signed in, and in which
+groups?", and leaves what each may do to the app.
 
 Sessions are stateless cookies, so **logout clears this browser's cookie but
 can't revoke a copy of it**; a stolen cookie lives until it expires (7 days,
