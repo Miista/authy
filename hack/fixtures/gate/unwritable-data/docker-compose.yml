@@ -8,7 +8,7 @@
 # which is not an error -- the store is what fails here.
 services:
   subject:
-    image: oidcgate-subject:integration
+    image: authy-subject:integration
     pull_policy: never
     user: "${RUN_AS}"
     restart: "no"

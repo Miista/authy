@@ -55,7 +55,7 @@ func TestOIDCFirstLaunchGoesStraightToTheIdP(t *testing.T) {
 	// The contract an app's Sign out button relies on.
 	js := b.Get("/auth/client.js", nil)
 	if js.Status != 200 || !strings.HasPrefix(js.Header.Get("Content-Type"), "application/javascript") ||
-		!strings.Contains(js.Body, `dataset.oidcgate="on"`) {
+		!strings.Contains(js.Body, `dataset.authy="on"`) {
 		t.Errorf("client.js: %d %s %q", js.Status, js.Header.Get("Content-Type"), js.Body)
 	}
 

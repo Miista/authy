@@ -4,7 +4,7 @@
 # be bounced back to the IdP in a loop. There is no form: sign-in is the IdP's.
 services:
   fakeidp:
-    image: oidcgate-fakeidp:integration
+    image: authy-fakeidp:integration
     pull_policy: never
     ports:
       - "127.0.0.1::8080"
@@ -14,7 +14,7 @@ services:
       FAKEIDP_DENY: "true"
 
   subject:
-    image: oidcgate-subject:integration
+    image: authy-subject:integration
     pull_policy: never
     user: "${RUN_AS}"
     depends_on:

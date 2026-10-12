@@ -24,7 +24,7 @@ func TestAuthDisabledLeavesTheAppOpen(t *testing.T) {
 		t.Errorf("api: %d", r.Status)
 	}
 	// client.js is a 404 here, which is what keeps an app's Sign out button hidden.
-	if r := b.Get("/auth/client.js", nil); r.Status == 200 && strings.Contains(r.Body, "oidcgate") {
+	if r := b.Get("/auth/client.js", nil); r.Status == 200 && strings.Contains(r.Body, "authy") {
 		t.Errorf("client.js must not exist with the gate off: %d", r.Status)
 	}
 	if !strings.Contains(s.Logs("subject"), "auth: disabled") {

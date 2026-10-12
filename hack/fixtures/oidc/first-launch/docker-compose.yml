@@ -9,7 +9,7 @@
 # is exactly what a real deployment has to get right.
 services:
   fakeidp:
-    image: oidcgate-fakeidp:integration
+    image: authy-fakeidp:integration
     pull_policy: never
     ports:
       - "127.0.0.1::8080"
@@ -18,7 +18,7 @@ services:
       REDIRECT_URI: "http://subject:8080/auth/callback"
 
   subject:
-    image: oidcgate-subject:integration
+    image: authy-subject:integration
     pull_policy: never
     user: "${RUN_AS}"
     depends_on:

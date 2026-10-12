@@ -1,4 +1,4 @@
-// Command subject is the smallest possible app behind oidcgate: the two lines
+// Command subject is the smallest possible app behind authy: the two lines
 // the README promises, and a page to protect. The integration suite builds it
 // into a scratch image and runs it as a container, so the gate is exercised
 // the way an app ships it -- as a non-root process in a container with a
@@ -12,12 +12,12 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/Miista/oidcgate"
+	"github.com/miista/authy"
 )
 
 func main() {
 	// The app is called "demo", so its settings are DEMO_AUTH_* and DEMO_OIDC_*.
-	gate, err := oidcgate.FromEnv(context.Background(), "demo")
+	gate, err := authy.FromEnv(context.Background(), "demo")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "invalid auth configuration:", err)
 		os.Exit(1)

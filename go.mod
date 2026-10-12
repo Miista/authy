@@ -1,4 +1,4 @@
-module github.com/Miista/oidcgate
+module github.com/miista/authy
 
 go 1.26.0
 

@@ -6,7 +6,7 @@
 # without a restart. There is deliberately no depends_on.
 services:
   fakeidp:
-    image: oidcgate-fakeidp:integration
+    image: authy-fakeidp:integration
     pull_policy: never
     profiles: ["late"]
     ports:
@@ -16,7 +16,7 @@ services:
       REDIRECT_URI: "http://subject:8080/auth/callback"
 
   subject:
-    image: oidcgate-subject:integration
+    image: authy-subject:integration
     pull_policy: never
     user: "${RUN_AS}"
     ports:

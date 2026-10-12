@@ -1,6 +1,6 @@
 //go:build integration
 
-// Package integration runs oidcgate the way an app ships it: inside a
+// Package integration runs authy the way an app ships it: inside a
 // container, as a non-root process, with a mounted data directory, next to a
 // real identity-provider container over a real docker network.
 //
@@ -27,16 +27,16 @@ import (
 )
 
 const (
-	subjectImage = "oidcgate-subject:integration"
-	idpImage     = "oidcgate-fakeidp:integration"
+	subjectImage = "authy-subject:integration"
+	idpImage     = "authy-fakeidp:integration"
 
 	// project is the compose project name for every scenario. Fixed, so a
 	// scenario can always be found again and removed -- a random one is how
 	// containers survive a killed run.
-	project = "oidcgate-it"
+	project = "authy-it"
 
 	// label marks everything the suite builds, so a sweep removes exactly ours.
-	label = "oidcgate-test"
+	label = "authy-test"
 )
 
 func repoRoot() (string, error) {
@@ -74,7 +74,7 @@ func daemonArch() string {
 // buildHelper compiles one of this repository's helper programs for the
 // daemon and wraps it in a FROM scratch image: nothing is pulled.
 func buildHelper(root, pkg, image, arch string) error {
-	dir, err := os.MkdirTemp("", "oidcgate-it-build")
+	dir, err := os.MkdirTemp("", "authy-it-build")
 	if err != nil {
 		return err
 	}

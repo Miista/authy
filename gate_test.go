@@ -1,4 +1,4 @@
-package oidcgate
+package authy
 
 import (
 	"context"
@@ -299,7 +299,7 @@ func TestClientJS(t *testing.T) {
 	if res.StatusCode != 200 || !strings.HasPrefix(res.Header.Get("Content-Type"), "application/javascript") {
 		t.Fatalf("client.js: %d %s", res.StatusCode, res.Header.Get("Content-Type"))
 	}
-	if !strings.Contains(body, `dataset.oidcgate="on"`) || !strings.Contains(body, "/auth/logout") {
+	if !strings.Contains(body, `dataset.authy="on"`) || !strings.Contains(body, "/auth/logout") {
 		t.Errorf("unexpected script: %q", body)
 	}
 	if res.Header.Get("X-Content-Type-Options") != "nosniff" {

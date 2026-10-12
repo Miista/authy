@@ -1,4 +1,4 @@
-package oidcgate
+package authy
 
 import (
 	"crypto/hmac"
@@ -167,7 +167,7 @@ func (g *Gate) endSession(w http.ResponseWriter, r *http.Request) {
 func randString() string {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
-		panic("oidcgate: no entropy: " + err.Error())
+		panic("authy: no entropy: " + err.Error())
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
 }

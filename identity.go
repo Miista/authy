@@ -1,4 +1,4 @@
-package oidcgate
+package authy
 
 import (
 	"context"

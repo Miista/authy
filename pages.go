@@ -1,4 +1,4 @@
-package oidcgate
+package authy
 
 import (
 	"html/template"
@@ -8,11 +8,11 @@ import (
 // clientJS is what /auth/client.js serves. An app that wants a "Sign out"
 // button includes it in <head> and hides gate-only UI with CSS:
 //
-//	html:not([data-oidcgate]) .only-with-gate { display: none !important }
+//	html:not([data-authy]) .only-with-gate { display: none !important }
 //
 // With the gate off the file is a 404, the attribute is never set, and the
 // UI stays hidden.
-const clientJS = `document.documentElement.dataset.oidcgate="on";window.oidcgate={signOutUrl:"/auth/logout"};` + "\n"
+const clientJS = `document.documentElement.dataset.authy="on";window.authy={signOutUrl:"/auth/logout"};` + "\n"
 
 // pageData drives the single template behind every gate page.
 type pageData struct {

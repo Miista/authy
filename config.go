@@ -1,4 +1,4 @@
-package oidcgate
+package authy
 
 import (
 	"context"
@@ -116,7 +116,7 @@ func FromEnv(ctx context.Context, app string, opts ...Option) (*Gate, error) {
 		return nil, err
 	}
 	if off {
-		slog.Warn("auth: disabled; the app is not protected by oidcgate", "reason", p+"AUTH_DISABLED")
+		slog.Warn("auth: disabled; the app is not protected by authy", "reason", p+"AUTH_DISABLED")
 		return nil, nil
 	}
 

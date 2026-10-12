@@ -1,6 +1,6 @@
-// Package oidcgate puts login in front of any net/http app with two lines:
+// Package authy puts login in front of any net/http app with two lines:
 //
-//	gate, err := oidcgate.FromEnv(ctx, "myapp") // reads MYAPP_* env vars
+//	gate, err := authy.FromEnv(ctx, "myapp") // reads MYAPP_* env vars
 //	if err != nil { log.Fatal(err) }            // misconfigured: refuse to start
 //	handler = gate.Wrap(handler)                // no-op when the gate is off
 //
@@ -14,7 +14,7 @@
 // provider authenticated the user for this client, and records that the
 // browser is authorized and who it is. An app that needs to tell people apart
 // reads that with UserFrom; one that does not never sees it.
-package oidcgate
+package authy
 
 import (
 	"context"

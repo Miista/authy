@@ -5,7 +5,7 @@
 # stays visible to the test instead of looping.
 services:
   subject:
-    image: oidcgate-subject:integration
+    image: authy-subject:integration
     pull_policy: never
     user: "${RUN_AS}"
     restart: "no"

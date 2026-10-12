@@ -6,7 +6,7 @@
 # written to the data directory.
 services:
   subject:
-    image: oidcgate-subject:integration
+    image: authy-subject:integration
     pull_policy: never
     user: "${RUN_AS}"
     ports:

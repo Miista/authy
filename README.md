@@ -1,4 +1,4 @@
-# oidcgate
+# authy
 
 A drop-in OpenID Connect auth gate for any `net/http` Go app, configured by
 environment variables. Sign-in is your IdP's job (Authelia, Authentik,
@@ -6,7 +6,7 @@ Keycloak, Entra ID, …); the gate is a relying party only, with no accounts,
 passwords or login form of its own.
 
 ```go
-gate, err := oidcgate.FromEnv(ctx, "myapp") // reads MYAPP_* env vars
+gate, err := authy.FromEnv(ctx, "myapp") // reads MYAPP_* env vars
 if err != nil {
 	log.Fatal(err) // misconfigured: refuse to start rather than serve unprotected
 }
@@ -81,10 +81,10 @@ checks the sign-in and records that the browser is authorized and who it is.
 An app that needs to tell people apart (roles, per-user records) asks the gate:
 
 ```go
-gate, err := oidcgate.FromEnv(ctx, "myapp", oidcgate.WithScopes("openid", "profile", "email", "groups"))
+gate, err := authy.FromEnv(ctx, "myapp", authy.WithScopes("openid", "profile", "email", "groups"))
 // ...
 func handler(w http.ResponseWriter, r *http.Request) {
-	u, ok := oidcgate.UserFrom(r)
+	u, ok := authy.UserFrom(r)
 	if !ok { /* nobody: treat as signed out */ }
 	if u.InGroup("admins") { /* ... */ }
 }
@@ -131,7 +131,7 @@ only announces itself:
 
 ```html
 <script src="/auth/client.js"></script>   <!-- in <head> -->
-<style>html:not([data-oidcgate]) .only-with-gate { display: none !important }</style>
+<style>html:not([data-authy]) .only-with-gate { display: none !important }</style>
 
 <a class="only-with-gate" href="/auth/logout">Sign out</a>
 ```
@@ -140,13 +140,13 @@ The sign-out refuses cross-site requests (`Sec-Fetch-Site`), so another site
 can't sign your users out with a crafted link, and lands on a small "signed
 out" page rather than bouncing straight back into the IdP's single sign-on.
 
-`/auth/client.js` sets `document.documentElement.dataset.oidcgate = "on"`. With
+`/auth/client.js` sets `document.documentElement.dataset.authy = "on"`. With
 the gate off it is a 404, the attribute never appears, and everything marked
 `only-with-gate` stays hidden.
 
 ## Apps that want a local account
 
-`oidcgate` is OIDC enablement and nothing else: no accounts, no passwords, no
+`authy` is OIDC enablement and nothing else: no accounts, no passwords, no
 login form. An app that also wants a local account (say, a break-glass login for
 when the IdP is down) builds that itself, with its own pages and its own
 session. It doesn't need anything from the gate, because `Wrap` is ordinary
@@ -217,4 +217,4 @@ delete `auth.json` and start it again (the signing key rotates).
 
 Options for the rare case the environment isn't enough: `WithPublicPaths`,
 `WithSessionTTL`, `WithScopes`, `WithLogger`, `WithDataDir`, or build a
-`Config` and call `oidcgate.New(ctx, cfg)`.
+`Config` and call `authy.New(ctx, cfg)`.
