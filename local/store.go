@@ -23,6 +23,9 @@ const (
 	minPassword  = 8
 	maxPassword  = 72 // bcrypt silently ignores bytes past 72, so refuse them instead
 	maxUsernameN = 64
+	// maxUsernameB keeps "local:"+username within the shell's 255-byte subject
+	// cap, so an account that can be created can always sign in.
+	maxUsernameB = 249
 )
 
 var errAccountExists = errors.New("an account already exists")
@@ -121,7 +124,7 @@ func validateCredentials(username, password string) error {
 	switch {
 	case username == "":
 		return errors.New("Enter a username.")
-	case utf8.RuneCountInString(username) > maxUsernameN:
+	case utf8.RuneCountInString(username) > maxUsernameN || len(username) > maxUsernameB:
 		return fmt.Errorf("The username can be at most %d characters.", maxUsernameN)
 	case !utf8.ValidString(username) || strings.ContainsFunc(username, unicode.IsControl):
 		// The shell strips control characters from the subject it seals, so a

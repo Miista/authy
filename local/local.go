@@ -29,7 +29,9 @@ type Method struct {
 }
 
 // New opens the account store in dir (the gate's data directory). Setup is
-// open while no account exists; creating the account closes it for good.
+// open while no account exists — trust-on-first-use, like the first launch
+// without OIDC: start the app where only you can reach it, claim the account,
+// then expose it. Creating the account closes setup for good.
 func New(sh shell.Shell, dir string) (*Method, error) {
 	st, err := openStore(dir)
 	if err != nil {

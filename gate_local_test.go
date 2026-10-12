@@ -256,7 +256,8 @@ func TestOIDCWithLocalEscapeHatch(t *testing.T) {
 		t.Fatalf("navigation should go to the IdP first, got %s", res.Header.Get("Location"))
 	}
 
-	// Setup is open while no account exists (deliberate: see Config.LocalLogin).
+	// Setup is open while no account exists (deliberate trust-on-first-use:
+	// claim the account before exposing the app; see Config.LocalLogin).
 	c := browser()
 	createAccount(t, c, app)
 	_, body := get(t, c, app.URL+"/whoami", nil)

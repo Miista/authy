@@ -141,6 +141,10 @@ fails with a clear message if not), and can't be moved. Sessions are signed
 However often a session is renewed, it ends for good four lifetimes (28 days)
 after sign-in.
 
+**To reset the local account, delete both `local.json` and `auth.json`** and
+restart: deleting only `local.json` reopens setup but leaves the signing key,
+so sessions from the old account stay valid until they expire.
+
 ## A Sign out button
 
 The gate can't choose where your UI puts a button, so the app does; the gate
