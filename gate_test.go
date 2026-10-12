@@ -672,7 +672,7 @@ func TestOIDCRejections(t *testing.T) {
 		_, _ = get(t, c, app.URL+"/auth/oidc", nil)
 		u, _ := url.Parse(app.URL)
 		for _, ck := range c.Jar.Cookies(&url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/auth/"}) {
-			if ck.Name == g.flowCookie {
+			if strings.HasSuffix(ck.Name, "_oidc_flow") {
 				c.Jar.SetCookies(u, []*http.Cookie{{Name: g.sessionCookie, Value: ck.Value, Path: "/"}})
 			}
 		}
@@ -694,10 +694,10 @@ func TestOIDCProviderDownAtStartup(t *testing.T) {
 	// The provider comes up; the gate notices and starts redirecting to it.
 	idp.Start()
 	deadline := time.Now().Add(5 * time.Second)
-	for g.oidcGet() == nil && time.Now().Before(deadline) {
+	for !g.methods[0].Ready() && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
-	if g.oidcGet() == nil {
+	if !g.methods[0].Ready() {
 		t.Fatal("the gate never picked up the provider")
 	}
 	if res, _ := get(t, noRedirect(browser()), app.URL+"/dash", nav); res.Header.Get("Location") != "/auth/oidc?next=%2Fdash" {
@@ -766,7 +766,7 @@ func TestFromEnv(t *testing.T) {
 		cctx, cancel := context.WithCancel(ctx)
 		defer cancel() // stops the background retry
 		g, err := FromEnv(cctx, "my-app", append(opts, dir(t))...)
-		if err != nil || g == nil || g.oidcGet() != nil {
+		if err != nil || g == nil || g.methods[0].Ready() {
 			t.Fatalf("got %v, %v", g, err)
 		}
 	})
@@ -782,7 +782,7 @@ func TestFromEnv(t *testing.T) {
 		if err != nil || g == nil {
 			t.Fatalf("got %v, %v", g, err)
 		}
-		if g.oidcGet() == nil {
+		if !g.methods[0].Ready() {
 			t.Error("OIDC should be ready")
 		}
 		for _, p := range []string{"/healthz", "/a", "/b/x", "/c"} {

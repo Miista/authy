@@ -21,11 +21,14 @@ type pageData struct {
 	Heading   string
 	Error     string
 	Message   string
-	ShowOIDC  bool
-	OIDCURL   string
-	OIDCLabel string
-	Link      string // optional trailing link, e.g. "Sign in again"
+	Entries   []pageEntry // one button per sign-in method
+	Link      string      // optional trailing link, e.g. "Sign in again"
 	LinkLabel string
+}
+
+type pageEntry struct {
+	Label string
+	URL   string
 }
 
 var pageTmpl = template.Must(template.New("page").Parse(`<!doctype html>
@@ -57,8 +60,8 @@ body{background:#f4f5f9;color:#1b1d27}
 <p class="app">{{.App}}</p>
 {{if .Error}}<p class="err" role="alert">{{.Error}}</p>{{end}}
 {{if .Message}}<p>{{.Message}}</p>{{end}}
-{{if .ShowOIDC}}
-<a class="btn" href="{{.OIDCURL}}">{{.OIDCLabel}}</a>
+{{range .Entries}}
+<a class="btn" href="{{.URL}}">{{.Label}}</a>
 {{end}}
 {{if .Link}}<p><a href="{{.Link}}">{{.LinkLabel}}</a></p>{{end}}
 </main></body></html>

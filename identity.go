@@ -114,31 +114,3 @@ func clean(s string, max int) string {
 	}
 	return s
 }
-
-// scopesOrDefault is what is asked of the provider: the configured scopes, or
-// "openid profile email", and always "openid".
-func scopesOrDefault(scopes []string) []string {
-	if len(scopes) == 0 {
-		return []string{"openid", "profile", "email"}
-	}
-	out := make([]string, 0, len(scopes)+1)
-	hasOpenID := false
-	for _, s := range scopes {
-		if s == "openid" {
-			hasOpenID = true
-		}
-	}
-	if !hasOpenID {
-		out = append(out, "openid")
-	}
-	return append(out, scopes...)
-}
-
-func wantsGroups(scopes []string) bool {
-	for _, s := range scopes {
-		if s == "groups" {
-			return true
-		}
-	}
-	return false
-}

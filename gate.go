@@ -5,38 +5,32 @@
 //	handler = gate.Wrap(handler)                // no-op when the gate is off
 //
 // The gate owns everything about authentication, so the app needs no code for
-// it: the OpenID Connect flow, sessions, sign-out, and the routes under
-// /auth/. Remove the two lines and the app has no idea any of it existed.
+// it: the sign-in methods, sessions, sign-out, and the routes under /auth/.
+// Remove the two lines and the app has no idea any of it existed.
 //
-// Sign-in itself belongs to the identity provider: the gate is a relying
-// party only, with no accounts, passwords or login form of its own. Who may
-// sign in is decided at the provider; the gate only verifies that the
-// provider authenticated the user for this client, and records that the
-// browser is authorized and who it is. An app that needs to tell people apart
-// reads that with UserFrom; one that does not never sees it.
+// Sign-in is a method's ceremony (today: OpenID Connect, where the identity
+// provider decides who may sign in); the gate runs the methods and owns the
+// one session they all result in. An app that needs to tell people apart reads
+// the identity with UserFrom; one that does not never sees it.
 package authy
 
 import (
 	"context"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/coreos/go-oidc/v3/oidc"
-	"golang.org/x/oauth2"
+	"github.com/miista/authy/internal/shell"
+	"github.com/miista/authy/oidc"
 )
 
 const (
 	clientJSPath  = "/auth/client.js"
-	loginPath     = "/auth/login" // the fallback page: a retry button and errors, never a form
-	oidcPath      = "/auth/oidc"
-	callbackPath  = "/auth/callback"
+	loginPath     = "/auth/login" // the fallback page: entries and errors, never a loop
 	logoutPath    = "/auth/logout"
 	loggedOutPath = "/auth/logged-out"
 
@@ -45,33 +39,20 @@ const (
 
 // Gate guards an app. Create one with FromEnv or New; a nil *Gate means "off".
 type Gate struct {
-	app    string
-	store  *store
-	ttl    time.Duration
-	public []string
-	log    *slog.Logger
-
-	// The provider is discovered in the background if it is unreachable at
-	// startup, so oidcS may be nil.
-	oidcCfg    *OIDCConfig
-	redirect   string
+	app        string
+	store      *store
+	ttl        time.Duration
+	public     []string
+	log        *slog.Logger
+	methods    []shell.Method
 	baseSecure bool
-	oidcMu     sync.RWMutex
-	oidcS      *oidcState
 
 	sessionCookie string
-	flowCookie    string
-}
-
-type oidcState struct {
-	oauth    *oauth2.Config
-	verifier *oidc.IDTokenVerifier
-	provider *oidc.Provider
 }
 
 // New validates cfg, opens the store (failing if its directory is not
-// writable) and, when OIDC is configured, tries to reach the provider. An
-// unreachable provider is not an error: discovery retries in the background.
+// writable) and builds the sign-in methods. An unreachable OIDC provider is
+// not an error: discovery retries in the background.
 func New(ctx context.Context, cfg Config) (*Gate, error) {
 	if cfg.App == "" {
 		return nil, errors.New("auth: App is required")
@@ -100,15 +81,11 @@ func New(ctx context.Context, cfg Config) (*Gate, error) {
 		public:        append([]string{"/healthz"}, cfg.PublicPaths...),
 		log:           log,
 		sessionCookie: name + "_session",
-		flowCookie:    name + "_oidc_flow",
 	}
 
 	o := cfg.OIDC
 	if o == nil {
 		return nil, errors.New("auth: OIDC is required (the gate has no login of its own)")
-	}
-	if o.Issuer == "" || o.ClientID == "" || o.ClientSecret == "" {
-		return nil, errors.New("auth: OIDC needs Issuer, ClientID and ClientSecret")
 	}
 	base, err := url.Parse(o.BaseURL)
 	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
@@ -117,73 +94,24 @@ func New(ctx context.Context, cfg Config) (*Gate, error) {
 	if strings.Trim(base.Path, "/") != "" || base.RawQuery != "" || base.Fragment != "" {
 		return nil, fmt.Errorf("auth: OIDC BaseURL %q must not contain a path, query or fragment", o.BaseURL)
 	}
-	g.oidcCfg = o
-	g.redirect = strings.TrimRight(o.BaseURL, "/") + callbackPath
 	g.baseSecure = base.Scheme == "https"
+	redirect := strings.TrimRight(o.BaseURL, "/") + "/auth/callback"
 
-	if err := g.discover(ctx, 5*time.Second); err != nil {
-		retry := cfg.retryBase
-		if retry <= 0 {
-			retry = 5 * time.Second
-		}
-		log.Warn("auth: OIDC provider not reachable yet; retrying in the background",
-			"issuer", o.Issuer, "err", err)
-		go g.discoverLoop(ctx, retry)
-	}
-
-	log.Info("auth: enabled", "issuer", g.oidcCfg.Issuer, "redirect_uri", g.redirect, "data_dir", dir)
-	return g, nil
-}
-
-func (g *Gate) oidcGet() *oidcState {
-	g.oidcMu.RLock()
-	defer g.oidcMu.RUnlock()
-	return g.oidcS
-}
-
-// discover contacts the provider and, on success, makes OIDC login available.
-func (g *Gate) discover(ctx context.Context, timeout time.Duration) error {
-	dctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	provider, err := oidc.NewProvider(dctx, g.oidcCfg.Issuer)
+	m, err := oidc.New(ctx, (*gateShell)(g), oidc.Config{
+		Issuer:       o.Issuer,
+		ClientID:     o.ClientID,
+		ClientSecret: o.ClientSecret,
+		RedirectURL:  redirect,
+		Scopes:       o.Scopes,
+		RetryBase:    cfg.retryBase,
+	}, name+"_oidc_flow")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	scopes := scopesOrDefault(g.oidcCfg.Scopes)
-	s := &oidcState{
-		provider: provider,
-		oauth: &oauth2.Config{
-			ClientID:     g.oidcCfg.ClientID,
-			ClientSecret: g.oidcCfg.ClientSecret,
-			Endpoint:     provider.Endpoint(),
-			RedirectURL:  g.redirect,
-			Scopes:       scopes,
-		},
-		verifier: provider.Verifier(&oidc.Config{ClientID: g.oidcCfg.ClientID}),
-	}
-	g.oidcMu.Lock()
-	g.oidcS = s
-	g.oidcMu.Unlock()
-	return nil
-}
+	g.methods = []shell.Method{m}
 
-func (g *Gate) discoverLoop(ctx context.Context, delay time.Duration) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(delay):
-		}
-		err := g.discover(ctx, 10*time.Second)
-		if err == nil {
-			g.log.Info("auth: OIDC provider reachable; OIDC login is now available", "issuer", g.oidcCfg.Issuer)
-			return
-		}
-		g.log.Warn("auth: OIDC provider still unreachable", "err", err)
-		if delay *= 2; delay > time.Minute {
-			delay = time.Minute
-		}
-	}
+	log.Info("auth: enabled", "issuer", o.Issuer, "redirect_uri", redirect, "data_dir", dir)
+	return g, nil
 }
 
 // Wrap returns next guarded by the gate. On a nil Gate it returns next
@@ -200,18 +128,17 @@ func (g *Gate) Wrap(next http.Handler) http.Handler {
 		case loginPath:
 			g.handleLogin(w, r)
 			return
-		case oidcPath:
-			g.handleOIDCStart(w, r)
-			return
-		case callbackPath:
-			g.handleCallback(w, r)
-			return
 		case logoutPath:
 			g.handleLogout(w, r)
 			return
 		case loggedOutPath:
 			g.handleLoggedOut(w, r)
 			return
+		}
+		for _, m := range g.methods {
+			if m.Serve(w, r) {
+				return
+			}
 		}
 		if g.isPublic(r.URL.Path) {
 			next.ServeHTTP(w, r)
@@ -266,14 +193,15 @@ func (g *Gate) deny(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
 }
 
-// entryURL picks where an unauthenticated page load starts: the provider,
-// or the fallback page when it has not been discovered yet.
+// entryURL picks where an unauthenticated page load starts: the first method
+// whose ceremony can start now, or the fallback page when none can.
 func (g *Gate) entryURL(next string) string {
-	q := "?next=" + url.QueryEscape(next)
-	if g.oidcGet() != nil {
-		return oidcPath + q
+	for _, m := range g.methods {
+		if m.Ready() {
+			return m.Entry(next).URL
+		}
 	}
-	return loginPath + q + "&error=unavailable"
+	return loginPath + "?next=" + url.QueryEscape(next) + "&error=unavailable"
 }
 
 func isNavigation(r *http.Request) bool {
@@ -301,10 +229,9 @@ func (g *Gate) handleClientJS(w http.ResponseWriter, r *http.Request) {
 
 // --- fallback page ---------------------------------------------------------
 
-// handleLogin renders the fallback page: a "sign in / try again" button and
-// the error from a failed or unavailable OIDC attempt. It never redirects, so
-// a rejection at the provider cannot loop. There is no form: sign-in itself
-// is the provider's.
+// handleLogin renders the fallback page: every method's entry and the error
+// from a failed or unavailable attempt. It never redirects, so a rejection at
+// a provider cannot loop.
 func (g *Gate) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
@@ -313,178 +240,16 @@ func (g *Gate) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	next, errCode := safeNext(q.Get("next")), q.Get("error")
-	d := pageData{
-		Title: "Sign in", Heading: "Sign in",
-		Error:     errorMessages[errCode],
-		ShowOIDC:  true,
-		OIDCURL:   oidcPath + "?next=" + url.QueryEscape(next),
-		OIDCLabel: "Sign in with OpenID Connect",
-	}
+	d := pageData{Title: "Sign in", Heading: "Sign in", Error: errorMessages[errCode]}
+	verb := "Sign in with "
 	if errCode != "" {
-		d.Title, d.Heading, d.OIDCLabel = "Sign-in failed", "Sign-in failed", "Try again with OpenID Connect"
+		d.Title, d.Heading, verb = "Sign-in failed", "Sign-in failed", "Try again with "
+	}
+	for _, m := range g.methods {
+		e := m.Entry(next)
+		d.Entries = append(d.Entries, pageEntry{Label: verb + e.Label, URL: e.URL})
 	}
 	g.render(w, http.StatusOK, d)
-}
-
-// --- OIDC ----------------------------------------------------------------
-
-func (g *Gate) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
-	next := safeNext(r.URL.Query().Get("next"))
-	s := g.oidcGet()
-	if s == nil {
-		g.loginFail(w, r, "unavailable", next, "provider not discovered yet")
-		return
-	}
-	flow := flowClaims{
-		State:    randString(),
-		Nonce:    randString(),
-		Verifier: oauth2.GenerateVerifier(),
-		Next:     next,
-		Exp:      time.Now().Add(flowTTL).Unix(),
-	}
-	g.setCookie(w, r, g.flowCookie, g.seal(purposeFlow, flow), "/auth", flowTTL)
-	authURL := s.oauth.AuthCodeURL(flow.State, oauth2.S256ChallengeOption(flow.Verifier), oidc.Nonce(flow.Nonce))
-	w.Header().Set("Cache-Control", "no-store")
-	http.Redirect(w, r, authURL, http.StatusFound)
-}
-
-func (g *Gate) handleCallback(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	q := r.URL.Query()
-
-	var flow flowClaims
-	ck, err := r.Cookie(g.flowCookie)
-	if err != nil || !g.open(purposeFlow, ck.Value, &flow) || time.Now().Unix() > flow.Exp {
-		g.loginFail(w, r, "failed", "/", "missing or invalid flow cookie")
-		return
-	}
-	g.clearCookie(w, r, g.flowCookie, "/auth")
-	next := safeNext(flow.Next)
-
-	if subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(flow.State)) != 1 {
-		g.loginFail(w, r, "failed", next, "state mismatch")
-		return
-	}
-	if e := q.Get("error"); e != "" {
-		code := "failed"
-		if e == "access_denied" {
-			code = "access_denied"
-		}
-		g.loginFail(w, r, code, next, "idp returned error "+e+": "+q.Get("error_description"))
-		return
-	}
-	s := g.oidcGet()
-	if s == nil {
-		g.loginFail(w, r, "unavailable", next, "provider not discovered yet")
-		return
-	}
-	code := q.Get("code")
-	if code == "" {
-		g.loginFail(w, r, "failed", next, "no code in callback")
-		return
-	}
-	tok, err := s.oauth.Exchange(r.Context(), code, oauth2.VerifierOption(flow.Verifier))
-	if err != nil {
-		g.loginFail(w, r, "failed", next, "token exchange: "+err.Error())
-		return
-	}
-	rawID, _ := tok.Extra("id_token").(string)
-	if rawID == "" {
-		g.loginFail(w, r, "failed", next, "no id_token in token response")
-		return
-	}
-	idToken, err := s.verifier.Verify(r.Context(), rawID)
-	if err != nil {
-		g.loginFail(w, r, "failed", next, "id_token verification: "+err.Error())
-		return
-	}
-	if subtle.ConstantTimeCompare([]byte(idToken.Nonce), []byte(flow.Nonce)) != 1 {
-		g.loginFail(w, r, "failed", next, "nonce mismatch")
-		return
-	}
-
-	u, err := g.oidcUser(r.Context(), s, tok, idToken)
-	if err != nil {
-		g.loginFail(w, r, "failed", next, "reading the user's claims: "+err.Error())
-		return
-	}
-	g.startSession(w, r, u)
-	g.log.Info("auth: oidc login ok", "sub", idToken.Subject)
-	redirectLocal(w, r, next)
-}
-
-// oidcClaims are the claims the gate reads, from the ID token or UserInfo.
-type oidcClaims struct {
-	PreferredUsername string   `json:"preferred_username"`
-	Name              string   `json:"name"`
-	Email             string   `json:"email"`
-	Groups            []string `json:"groups"`
-	hasGroups         bool
-}
-
-// oidcUser builds the signed-in user. Some providers (Authelia by default)
-// serve the profile and groups only from the UserInfo endpoint, so when groups
-// were asked for and the ID token has none, UserInfo is asked too. It is not
-// optional then: an app that asked for groups decides who may do what by them,
-// so a login whose groups cannot be read fails rather than carry on without
-// them. A user with no groups at all is fine, and is told apart from "could not
-// ask" by the call succeeding.
-func (g *Gate) oidcUser(ctx context.Context, s *oidcState, tok *oauth2.Token, idToken *oidc.IDToken) (*sessionUser, error) {
-	var c oidcClaims
-	if err := idToken.Claims(&c); err != nil {
-		return nil, err
-	}
-	var raw map[string]any
-	if err := idToken.Claims(&raw); err != nil {
-		return nil, err
-	}
-	_, c.hasGroups = raw["groups"]
-
-	if wantsGroups(g.oidcCfg.Scopes) && !c.hasGroups {
-		ui, err := s.provider.UserInfo(ctx, oauth2.StaticTokenSource(tok))
-		if err != nil {
-			return nil, fmt.Errorf("userinfo: %w", err)
-		}
-		if ui.Subject != idToken.Subject {
-			return nil, errors.New("userinfo is for a different subject than the id_token")
-		}
-		var fromInfo oidcClaims
-		if err := ui.Claims(&fromInfo); err != nil {
-			return nil, err
-		}
-		// The ID token's own values win; UserInfo fills what it lacks.
-		if c.PreferredUsername == "" {
-			c.PreferredUsername = fromInfo.PreferredUsername
-		}
-		if c.Name == "" {
-			c.Name = fromInfo.Name
-		}
-		if c.Email == "" {
-			c.Email = fromInfo.Email
-		}
-		c.Groups = fromInfo.Groups
-	}
-
-	name := c.PreferredUsername
-	if name == "" {
-		name = c.Name
-	}
-	u := newSessionUser(idToken.Subject, name, c.Email, c.Groups)
-	if u == nil {
-		return nil, errors.New("the id_token has no subject")
-	}
-	if len(c.Groups) > len(u.Groups) {
-		g.log.Warn("auth: some groups were dropped (too many or too long)", "sub", idToken.Subject, "sent", len(c.Groups), "kept", len(u.Groups))
-	}
-	return u, nil
-}
-
-// loginFail logs the detail and sends the browser to the fallback page with a
-// generic error code, where it shows a retry button instead of redirecting
-// again.
-func (g *Gate) loginFail(w http.ResponseWriter, r *http.Request, code, next, detail string) {
-	g.log.Warn("auth: oidc login not completed", "code", code, "reason", detail)
-	http.Redirect(w, r, loginPath+"?error="+code+"&next="+url.QueryEscape(next), http.StatusFound)
 }
 
 // --- logout --------------------------------------------------------------
