@@ -3,7 +3,6 @@
 package integration
 
 import (
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -24,8 +23,8 @@ func waitForOIDC(t *testing.T, s *Scenario) {
 	}, func() string { return s.Logs("subject") + "\n" + s.Logs("fakeidp") })
 }
 
-// OIDC from the first launch: a page load goes to the IdP, the login completes
-// through it, no local account is created, and setup stays closed.
+// A page load goes to the IdP, the login completes through it, and the data
+// directory holds only the signing key -- no account of any kind.
 func TestOIDCFirstLaunchGoesStraightToTheIdP(t *testing.T) {
 	s := Up(t, "oidc/first-launch")
 	s.WaitReady()
@@ -53,44 +52,56 @@ func TestOIDCFirstLaunchGoesStraightToTheIdP(t *testing.T) {
 		t.Errorf("session after the OIDC login: %d", r.Status)
 	}
 
-	// No account was created, and nobody can claim the app by being first.
-	if r := s.Browser().Still().Get("/auth/setup", Nav); r.Status != 302 || r.Header.Get("Location") != "/auth/login" {
-		t.Errorf("setup must be closed with OIDC: %d -> %s", r.Status, r.Header.Get("Location"))
+	// The contract an app's Sign out button relies on.
+	js := b.Get("/auth/client.js", nil)
+	if js.Status != 200 || !strings.HasPrefix(js.Header.Get("Content-Type"), "application/javascript") ||
+		!strings.Contains(js.Body, `dataset.oidcgate="on"`) {
+		t.Errorf("client.js: %d %s %q", js.Status, js.Header.Get("Content-Type"), js.Body)
 	}
+
+	// On disk: only the signing key and sign-out records; the gate has no accounts.
 	raw, err := os.ReadFile(filepath.Join(s.Dir, "data", "auth", "auth.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "password_hash") || strings.Contains(string(raw), "username") {
-		t.Errorf("no local account should exist: %s", raw)
+	if !strings.Contains(string(raw), "session_key") ||
+		strings.Contains(string(raw), "password_hash") || strings.Contains(string(raw), "username") {
+		t.Errorf("auth.json should hold only the gate's own state: %s", raw)
 	}
 }
 
-// An account exists and OIDC is configured: the IdP is still tried first, and
-// the local form stays reachable at /auth/login (the way in if the IdP is down).
-func TestOIDCWithAnAccountStillTriesTheIdPFirst(t *testing.T) {
-	s := Up(t, "oidc/with-account")
+// The session key lives in the volume, so a restarted container still knows
+// who you are; signing out is a confirmed POST and revokes the session.
+func TestSessionSurvivesARestartAndLogoutEndsIt(t *testing.T) {
+	s := Up(t, "oidc/first-launch")
 	s.WaitReady()
 	waitForOIDC(t, s)
-
-	if r := s.Browser().Get("/dash", Nav); r.Status != 200 || !strings.Contains(r.Body, "hello demo") {
-		t.Errorf("OIDC login with an existing account: %d at %s", r.Status, r.URL)
-	}
-
 	b := s.Browser()
-	page := b.Get("/auth/login", Nav)
-	if !strings.Contains(page.Body, `action="/auth/login"`) || !strings.Contains(page.Body, "Sign in with OpenID Connect") {
-		t.Fatalf("/auth/login must offer the local form and the OIDC button: %.300s", page.Body)
+	if r := b.Get("/", Nav); r.Status != 200 || !strings.Contains(r.Body, "hello demo") {
+		t.Fatalf("sign-in: %d at %s", r.Status, r.URL)
 	}
-	tok := b.Token("/auth/login")
-	if r := b.Post("/auth/login", url.Values{"csrf": {tok}, "username": {user}, "password": {pass}}); r.Status != 200 || !strings.Contains(r.Body, "hello demo") {
-		t.Errorf("local login while OIDC is configured: %d", r.Status)
+
+	s.Restart("subject")
+	s.WaitReady()
+
+	if r := b.Get("/", FetchAPI); r.Status != 200 || !strings.Contains(r.Body, "hello demo") {
+		t.Errorf("the session did not survive a restart: %d", r.Status)
+	}
+
+	// Sign-out is a same-site navigation; the landing page keeps the browser
+	// from bouncing back into the IdP's SSO session.
+	if r := b.Get("/auth/logout", Nav); r.URL.Path != "/auth/logged-out" || !strings.Contains(r.Body, "signed out") {
+		t.Errorf("logout: %d at %s", r.Status, r.URL)
+	}
+	if r := b.Get("/", FetchAPI); r.Status != 401 {
+		t.Errorf("still signed in after logout: %d", r.Status)
 	}
 }
 
-// The IdP does not approve: the user lands once on a page with the local form
-// and a retry button. A loop would make the client give up after ten redirects.
-func TestOIDCDeniedFallsBackToTheLocalForm(t *testing.T) {
+// The IdP does not approve: the user lands once on the fallback page with a
+// retry button and no form. A loop would make the client give up after ten
+// redirects.
+func TestOIDCDeniedFallsBackWithoutLooping(t *testing.T) {
 	s := Up(t, "oidc/idp-denies")
 	s.WaitReady()
 	waitForOIDC(t, s)
@@ -98,21 +109,23 @@ func TestOIDCDeniedFallsBackToTheLocalForm(t *testing.T) {
 
 	r := b.Get("/dash", Nav)
 	if r.Status != 200 || r.URL.Path != "/auth/login" {
-		t.Fatalf("expected the sign-in page, got %d at %s", r.Status, r.URL)
+		t.Fatalf("expected the fallback page, got %d at %s", r.Status, r.URL)
 	}
-	for _, want := range []string{`action="/auth/login"`, "Try again with OpenID Connect", "not approved by the identity provider"} {
+	for _, want := range []string{"Try again with OpenID Connect", "not approved by the identity provider"} {
 		if !strings.Contains(r.Body, want) {
 			t.Errorf("the fallback page is missing %q", want)
 		}
 	}
-	tok := b.Token("/auth/login")
-	if r := b.Post("/auth/login", url.Values{"csrf": {tok}, "username": {user}, "password": {pass}}); r.Status != 200 || !strings.Contains(r.Body, "hello demo") {
-		t.Errorf("the local form must work from the fallback page: %d", r.Status)
+	if strings.Contains(r.Body, "<form") {
+		t.Errorf("the fallback page must not have a form: %.300s", r.Body)
+	}
+	if r := b.Get("/", FetchAPI); r.Status != 401 {
+		t.Errorf("the denied login must not have signed anyone in: %d", r.Status)
 	}
 }
 
-// The IdP is not running when the app starts. The app starts anyway, the local
-// login keeps working, and once the IdP appears the app starts using it
+// The IdP is not running when the app starts. The app starts anyway, explains
+// that the provider is unreachable, and once the IdP appears starts using it
 // without being restarted.
 func TestOIDCProviderDownAtStartup(t *testing.T) {
 	s := Up(t, "oidc/idp-down-at-start")
@@ -120,12 +133,8 @@ func TestOIDCProviderDownAtStartup(t *testing.T) {
 
 	b := s.Browser()
 	r := b.Get("/", Nav)
-	if r.Status != 200 || r.URL.Path != "/auth/login" || !strings.Contains(r.Body, `action="/auth/login"`) {
-		t.Fatalf("with the IdP down, the local form must be the way in: %d at %s", r.Status, r.URL)
-	}
-	tok := b.Token("/auth/login")
-	if r := b.Post("/auth/login", url.Values{"csrf": {tok}, "username": {user}, "password": {pass}}); r.Status != 200 || !strings.Contains(r.Body, "hello demo") {
-		t.Errorf("local login while the IdP is down: %d", r.Status)
+	if r.Status != 200 || r.URL.Path != "/auth/login" || !strings.Contains(r.Body, "not reachable") || strings.Contains(r.Body, "<form") {
+		t.Fatalf("with the IdP down, the fallback page must say so: %d at %s: %.300s", r.Status, r.URL, r.Body)
 	}
 	if !strings.Contains(s.Logs("subject"), "not reachable yet") {
 		t.Errorf("the log should say the provider is unreachable and retrying:\n%s", s.Logs("subject"))
@@ -136,35 +145,5 @@ func TestOIDCProviderDownAtStartup(t *testing.T) {
 
 	if r := s.Browser().Get("/dash", Nav); r.Status != 200 || !strings.Contains(r.Body, "hello demo") {
 		t.Errorf("sign-in through the IdP after it came up: %d at %s", r.Status, r.URL)
-	}
-}
-
-// OIDC is the only way in: the local form is gone from the page and the
-// server refuses it, so a hidden form is not all that stands in the way.
-func TestOIDCOnlyWhenBuiltInLoginIsDisabled(t *testing.T) {
-	s := Up(t, "oidc/built-in-disabled")
-	s.WaitReady()
-	waitForOIDC(t, s)
-
-	b := s.Browser()
-	page := b.Get("/auth/login", Nav)
-	if strings.Contains(page.Body, "<form") || !strings.Contains(page.Body, "OpenID Connect") {
-		t.Errorf("the local form must be gone: %.300s", page.Body)
-	}
-	// Give the browser a matching CSRF cookie and field (the check is a
-	// double-submit, so a client that sets both passes it), so the request gets
-	// past CSRF and reaches the decision that is under test: the server's own
-	// refusal, not the absence of a form.
-	su, _ := url.Parse(subjectURL)
-	b.Jar.SetCookies(su, []*http.Cookie{{Name: "demo_csrf", Value: "x", Path: "/auth"}})
-	r := b.Post("/auth/login", url.Values{"csrf": {"x"}, "username": {user}, "password": {pass}})
-	if r.Status != 403 || !strings.Contains(r.Body, "Local sign-in is disabled") {
-		t.Errorf("local login must be refused by the server: %d %.200s", r.Status, r.Body)
-	}
-	if r := b.Get("/", FetchAPI); r.Status != 401 {
-		t.Errorf("the refused login must not have signed anyone in: %d", r.Status)
-	}
-	if r := s.Browser().Get("/dash", Nav); r.Status != 200 || !strings.Contains(r.Body, "hello demo") {
-		t.Errorf("OIDC login: %d", r.Status)
 	}
 }

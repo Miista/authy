@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -327,19 +326,6 @@ func (b *Browser) Post(target string, form url.Values) *Resp {
 		b.s.t.Fatalf("POST %s: %v", target, err)
 	}
 	return r
-}
-
-var csrfRe = regexp.MustCompile(`name="csrf" value="([^"]+)"`)
-
-// Token loads a gate page and returns its CSRF token (the cookie lands in the jar).
-func (b *Browser) Token(page string) string {
-	b.s.t.Helper()
-	r := b.Get(page, Nav)
-	m := csrfRe.FindStringSubmatch(r.Body)
-	if m == nil {
-		b.s.t.Fatalf("no CSRF token on %s (status %d): %.300s", page, r.Status, r.Body)
-	}
-	return m[1]
 }
 
 // Cookie returns a cookie the browser holds for the subject, if any.

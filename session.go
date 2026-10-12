@@ -4,12 +4,10 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -166,79 +164,10 @@ func (g *Gate) endSession(w http.ResponseWriter, r *http.Request) {
 	g.clearCookie(w, r, g.sessionCookie, "/")
 }
 
-// csrfToken returns the double-submit token for the login and setup forms,
-// setting its cookie if the browser has none yet.
-func (g *Gate) csrfToken(w http.ResponseWriter, r *http.Request) string {
-	if ck, err := r.Cookie(g.csrfCookie); err == nil && len(ck.Value) == 43 {
-		return ck.Value
-	}
-	t := randString()
-	g.setCookie(w, r, g.csrfCookie, t, "/auth", 24*time.Hour)
-	return t
-}
-
-// checkCSRF accepts a POST only when it comes from this site (when the browser
-// says where it came from) and its form token matches the cookie's.
-func (g *Gate) checkCSRF(r *http.Request) bool {
-	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
-		return false
-	}
-	ck, err := r.Cookie(g.csrfCookie)
-	if err != nil || ck.Value == "" {
-		return false
-	}
-	return subtle.ConstantTimeCompare([]byte(ck.Value), []byte(r.PostFormValue("csrf"))) == 1
-}
-
 func randString() string {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		panic("oidcgate: no entropy: " + err.Error())
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-// limiter blocks password guessing: after max failures within window, every
-// local login is refused until the window passes. It is process-wide, not per
-// IP, because behind a proxy the client address cannot be trusted. OIDC logins
-// are unaffected.
-type limiter struct {
-	mu     sync.Mutex
-	fails  []time.Time
-	max    int
-	window time.Duration
-}
-
-func newLimiter() *limiter { return &limiter{max: 5, window: time.Minute} }
-
-// blocked reports whether logins are currently refused, and for how long.
-func (l *limiter) blocked(now time.Time) (bool, time.Duration) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.pruneLocked(now)
-	if len(l.fails) < l.max {
-		return false, 0
-	}
-	return true, l.fails[0].Add(l.window).Sub(now)
-}
-
-func (l *limiter) fail(now time.Time) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.pruneLocked(now)
-	l.fails = append(l.fails, now)
-}
-
-func (l *limiter) reset() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.fails = nil
-}
-
-func (l *limiter) pruneLocked(now time.Time) {
-	i := 0
-	for i < len(l.fails) && now.Sub(l.fails[i]) >= l.window {
-		i++
-	}
-	l.fails = l.fails[i:]
 }

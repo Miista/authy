@@ -5,14 +5,15 @@
 //	handler = gate.Wrap(handler)                // no-op when the gate is off
 //
 // The gate owns everything about authentication, so the app needs no code for
-// it: a local account (created on first launch), optional OpenID Connect
-// login, the login/setup/error pages, sessions, and the routes under /auth/.
-// Remove the two lines and the app has no idea any of it existed.
+// it: the OpenID Connect flow, sessions, sign-out, and the routes under
+// /auth/. Remove the two lines and the app has no idea any of it existed.
 //
-// Who may sign in through OIDC is decided at the identity provider; the gate
-// only verifies that the provider authenticated the user for this client, and
-// records that the browser is authorized and who it is. An app that needs to tell
-// people apart reads that with UserFrom; one that does not never sees it.
+// Sign-in itself belongs to the identity provider: the gate is a relying
+// party only, with no accounts, passwords or login form of its own. Who may
+// sign in is decided at the provider; the gate only verifies that the
+// provider authenticated the user for this client, and records that the
+// browser is authorized and who it is. An app that needs to tell people apart
+// reads that with UserFrom; one that does not never sees it.
 package oidcgate
 
 import (
@@ -23,7 +24,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,8 +34,7 @@ import (
 
 const (
 	clientJSPath  = "/auth/client.js"
-	loginPath     = "/auth/login"
-	setupPath     = "/auth/setup"
+	loginPath     = "/auth/login" // the fallback page: a retry button and errors, never a form
 	oidcPath      = "/auth/oidc"
 	callbackPath  = "/auth/callback"
 	logoutPath    = "/auth/logout"
@@ -51,19 +50,16 @@ type Gate struct {
 	ttl    time.Duration
 	public []string
 	log    *slog.Logger
-	lim    *limiter
 
-	// OIDC (oidcCfg == nil: local account only). The provider is discovered in
-	// the background if it is unreachable at startup, so oidcS may be nil.
-	oidcCfg       *OIDCConfig
-	redirect      string
-	baseSecure    bool
-	localDisabled bool
-	oidcMu        sync.RWMutex
-	oidcS         *oidcState
+	// The provider is discovered in the background if it is unreachable at
+	// startup, so oidcS may be nil.
+	oidcCfg    *OIDCConfig
+	redirect   string
+	baseSecure bool
+	oidcMu     sync.RWMutex
+	oidcS      *oidcState
 
 	sessionCookie string
-	csrfCookie    string
 	flowCookie    string
 }
 
@@ -103,50 +99,41 @@ func New(ctx context.Context, cfg Config) (*Gate, error) {
 		ttl:           ttl,
 		public:        append([]string{"/healthz"}, cfg.PublicPaths...),
 		log:           log,
-		lim:           newLimiter(),
 		sessionCookie: name + "_session",
-		csrfCookie:    name + "_csrf",
 		flowCookie:    name + "_oidc_flow",
 	}
 
-	if o := cfg.OIDC; o != nil {
-		if o.Issuer == "" || o.ClientID == "" || o.ClientSecret == "" {
-			return nil, errors.New("auth: OIDC needs Issuer, ClientID and ClientSecret")
-		}
-		base, err := url.Parse(o.BaseURL)
-		if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
-			return nil, fmt.Errorf("auth: OIDC BaseURL %q must be an absolute http(s) URL", o.BaseURL)
-		}
-		if strings.Trim(base.Path, "/") != "" || base.RawQuery != "" || base.Fragment != "" {
-			return nil, fmt.Errorf("auth: OIDC BaseURL %q must not contain a path, query or fragment", o.BaseURL)
-		}
-		g.oidcCfg = o
-		g.redirect = strings.TrimRight(o.BaseURL, "/") + callbackPath
-		g.baseSecure = base.Scheme == "https"
-		g.localDisabled = cfg.DisableBuiltInLogin
+	o := cfg.OIDC
+	if o == nil {
+		return nil, errors.New("auth: OIDC is required (the gate has no login of its own)")
+	}
+	if o.Issuer == "" || o.ClientID == "" || o.ClientSecret == "" {
+		return nil, errors.New("auth: OIDC needs Issuer, ClientID and ClientSecret")
+	}
+	base, err := url.Parse(o.BaseURL)
+	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
+		return nil, fmt.Errorf("auth: OIDC BaseURL %q must be an absolute http(s) URL", o.BaseURL)
+	}
+	if strings.Trim(base.Path, "/") != "" || base.RawQuery != "" || base.Fragment != "" {
+		return nil, fmt.Errorf("auth: OIDC BaseURL %q must not contain a path, query or fragment", o.BaseURL)
+	}
+	g.oidcCfg = o
+	g.redirect = strings.TrimRight(o.BaseURL, "/") + callbackPath
+	g.baseSecure = base.Scheme == "https"
 
-		if err := g.discover(ctx, 5*time.Second); err != nil {
-			retry := cfg.retryBase
-			if retry <= 0 {
-				retry = 5 * time.Second
-			}
-			log.Warn("auth: OIDC provider not reachable yet; retrying in the background (local login keeps working)",
-				"issuer", o.Issuer, "err", err)
-			go g.discoverLoop(ctx, retry)
+	if err := g.discover(ctx, 5*time.Second); err != nil {
+		retry := cfg.retryBase
+		if retry <= 0 {
+			retry = 5 * time.Second
 		}
-	} else if cfg.DisableBuiltInLogin {
-		log.Warn("auth: DISABLE_BUILT_IN_LOGIN is ignored because OIDC is not enabled")
+		log.Warn("auth: OIDC provider not reachable yet; retrying in the background",
+			"issuer", o.Issuer, "err", err)
+		go g.discoverLoop(ctx, retry)
 	}
 
-	args := []any{"oidc", g.oidcCfg != nil, "local_account", st.hasAccount(), "local_login", g.localEnabled(), "data_dir", dir}
-	if g.oidcCfg != nil {
-		args = append(args, "issuer", g.oidcCfg.Issuer, "redirect_uri", g.redirect)
-	}
-	log.Info("auth: enabled", args...)
+	log.Info("auth: enabled", "issuer", g.oidcCfg.Issuer, "redirect_uri", g.redirect, "data_dir", dir)
 	return g, nil
 }
-
-func (g *Gate) localEnabled() bool { return !g.localDisabled }
 
 func (g *Gate) oidcGet() *oidcState {
 	g.oidcMu.RLock()
@@ -212,9 +199,6 @@ func (g *Gate) Wrap(next http.Handler) http.Handler {
 			return
 		case loginPath:
 			g.handleLogin(w, r)
-			return
-		case setupPath:
-			g.handleSetup(w, r)
 			return
 		case oidcPath:
 			g.handleOIDCStart(w, r)
@@ -282,23 +266,14 @@ func (g *Gate) deny(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
 }
 
-// entryURL picks where an unauthenticated page load starts, per the flow:
-// OIDC first whenever it is configured; otherwise the local pages.
+// entryURL picks where an unauthenticated page load starts: the provider,
+// or the fallback page when it has not been discovered yet.
 func (g *Gate) entryURL(next string) string {
 	q := "?next=" + url.QueryEscape(next)
-	hasAccount := g.store.hasAccount()
-	switch {
-	case g.oidcCfg != nil && g.oidcGet() != nil:
+	if g.oidcGet() != nil {
 		return oidcPath + q
-	case g.oidcCfg != nil && hasAccount && g.localEnabled():
-		return loginPath + q // provider unreachable: local login is the fallback
-	case g.oidcCfg != nil:
-		return loginPath + q + "&error=unavailable"
-	case !hasAccount:
-		return setupPath + q
-	default:
-		return loginPath + q
 	}
+	return loginPath + q + "&error=unavailable"
 }
 
 func isNavigation(r *http.Request) bool {
@@ -324,163 +299,36 @@ func (g *Gate) handleClientJS(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(clientJS))
 }
 
-// --- local login ---------------------------------------------------------
+// --- fallback page ---------------------------------------------------------
 
+// handleLogin renders the fallback page: a "sign in / try again" button and
+// the error from a failed or unavailable OIDC attempt. It never redirects, so
+// a rejection at the provider cannot loop. There is no form: sign-in itself
+// is the provider's.
 func (g *Gate) handleLogin(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet, http.MethodHead:
-		q := r.URL.Query()
-		g.showLogin(w, r, http.StatusOK, "", safeNext(q.Get("next")), q.Get("error"))
-	case http.MethodPost:
-		g.postLogin(w, r)
-	default:
-		w.Header().Set("Allow", "GET, HEAD, POST")
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-// showLogin renders the sign-in page: the local form (when an account exists
-// and local login is allowed) and the OIDC button (when configured). After a
-// failed OIDC attempt it is the fallback page, and it never redirects, so a
-// rejection cannot loop.
-func (g *Gate) showLogin(w http.ResponseWriter, r *http.Request, status int, msg, next, errCode string) {
-	hasAccount := g.store.hasAccount()
-	if !hasAccount && g.oidcCfg == nil {
-		http.Redirect(w, r, setupPath+"?next="+url.QueryEscape(next), http.StatusFound)
 		return
 	}
-	d := pageData{Title: "Sign in", Heading: "Sign in", Next: next, Error: msg}
-	if d.Error == "" {
-		d.Error = errorMessages[errCode]
+	q := r.URL.Query()
+	next, errCode := safeNext(q.Get("next")), q.Get("error")
+	d := pageData{
+		Title: "Sign in", Heading: "Sign in",
+		Error:     errorMessages[errCode],
+		ShowOIDC:  true,
+		OIDCURL:   oidcPath + "?next=" + url.QueryEscape(next),
+		OIDCLabel: "Sign in with OpenID Connect",
 	}
-	d.ShowForm = hasAccount && g.localEnabled()
-	if g.oidcCfg != nil {
-		d.ShowOIDC = true
-		d.OIDCURL = oidcPath + "?next=" + url.QueryEscape(next)
-		d.OIDCLabel = "Sign in with OpenID Connect"
-		if errCode != "" {
-			d.OIDCLabel = "Try again with OpenID Connect"
-		}
+	if errCode != "" {
+		d.Title, d.Heading, d.OIDCLabel = "Sign-in failed", "Sign-in failed", "Try again with OpenID Connect"
 	}
-	if d.ShowForm {
-		d.CSRF = g.csrfToken(w, r)
-	} else if errCode != "" {
-		d.Title, d.Heading = "Sign-in failed", "Sign-in failed"
-	}
-	g.render(w, status, d)
-}
-
-func (g *Gate) postLogin(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	next := safeNext(r.PostFormValue("next"))
-	if !g.checkCSRF(r) {
-		g.showLogin(w, r, http.StatusForbidden, "Your session expired. Please try again.", next, "")
-		return
-	}
-	if !g.localEnabled() {
-		g.render(w, http.StatusForbidden, pageData{
-			Title: "Local sign-in is disabled", Heading: "Local sign-in is disabled",
-			Message: "Use OpenID Connect to sign in.", ShowOIDC: true,
-			OIDCURL: oidcPath + "?next=" + url.QueryEscape(next), OIDCLabel: "Sign in with OpenID Connect",
-		})
-		return
-	}
-	if !g.store.hasAccount() {
-		http.Redirect(w, r, loginPath+"?next="+url.QueryEscape(next), http.StatusFound)
-		return
-	}
-	now := time.Now()
-	if blocked, wait := g.lim.blocked(now); blocked {
-		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
-		g.showLogin(w, r, http.StatusTooManyRequests, "Too many failed attempts. Try again in a minute.", next, "")
-		return
-	}
-	if !g.store.verify(r.PostFormValue("username"), r.PostFormValue("password")) {
-		g.lim.fail(now)
-		g.log.Warn("auth: local login failed")
-		g.showLogin(w, r, http.StatusUnauthorized, "Invalid username or password.", next, "")
-		return
-	}
-	g.lim.reset()
-	g.startSession(w, r, localUser(r.PostFormValue("username")))
-	g.log.Info("auth: local login ok")
-	redirectLocal(w, r, next)
-}
-
-// --- first-launch account creation --------------------------------------
-
-func (g *Gate) handleSetup(w http.ResponseWriter, r *http.Request) {
-	// Setup exists only for a first launch without OIDC. With OIDC configured
-	// there is no local account to create, and nobody can claim the app by
-	// being first.
-	if g.oidcCfg != nil || g.store.hasAccount() {
-		http.Redirect(w, r, loginPath, http.StatusFound)
-		return
-	}
-	switch r.Method {
-	case http.MethodGet, http.MethodHead:
-		g.showSetup(w, r, http.StatusOK, "", safeNext(r.URL.Query().Get("next")))
-	case http.MethodPost:
-		g.postSetup(w, r)
-	default:
-		w.Header().Set("Allow", "GET, HEAD, POST")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
-func (g *Gate) showSetup(w http.ResponseWriter, r *http.Request, status int, msg, next string) {
-	g.render(w, status, pageData{
-		Title: "Create your account", Heading: "Create your account",
-		Message: "Choose a username and password. This is the only account.",
-		Error:   msg, Next: next, ShowSetup: true, CSRF: g.csrfToken(w, r),
-	})
-}
-
-func (g *Gate) postSetup(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 4096)
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	next := safeNext(r.PostFormValue("next"))
-	if !g.checkCSRF(r) {
-		g.showSetup(w, r, http.StatusForbidden, "Your session expired. Please try again.", next)
-		return
-	}
-	username, password := strings.TrimSpace(r.PostFormValue("username")), r.PostFormValue("password")
-	if err := validateCredentials(username, password); err != nil {
-		g.showSetup(w, r, http.StatusBadRequest, err.Error(), next)
-		return
-	}
-	if subtle.ConstantTimeCompare([]byte(password), []byte(r.PostFormValue("confirm"))) != 1 {
-		g.showSetup(w, r, http.StatusBadRequest, "The passwords do not match.", next)
-		return
-	}
-	switch err := g.store.createAccount(username, password); {
-	case errors.Is(err, errAccountExists):
-		http.Redirect(w, r, loginPath+"?next="+url.QueryEscape(next), http.StatusFound)
-		return
-	case err != nil:
-		g.log.Error("auth: creating the account", "err", err)
-		g.showSetup(w, r, http.StatusInternalServerError, "Could not save the account. Check the server log.", next)
-		return
-	}
-	g.log.Info("auth: local account created")
-	g.startSession(w, r, localUser(username)) // the key was rotated by createAccount, so this cookie is the only valid one
-	redirectLocal(w, r, next)
+	g.render(w, http.StatusOK, d)
 }
 
 // --- OIDC ----------------------------------------------------------------
 
 func (g *Gate) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
-	if g.oidcCfg == nil {
-		http.NotFound(w, r)
-		return
-	}
 	next := safeNext(r.URL.Query().Get("next"))
 	s := g.oidcGet()
 	if s == nil {
@@ -501,10 +349,6 @@ func (g *Gate) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gate) handleCallback(w http.ResponseWriter, r *http.Request) {
-	if g.oidcCfg == nil {
-		http.NotFound(w, r)
-		return
-	}
 	w.Header().Set("Cache-Control", "no-store")
 	q := r.URL.Query()
 
@@ -621,17 +465,11 @@ func (g *Gate) oidcUser(ctx context.Context, s *oidcState, tok *oauth2.Token, id
 		c.Groups = fromInfo.Groups
 	}
 
-	// "local:" is the built-in account's namespace (see localUser). A provider
-	// subject inside it would collide with the local admin for any app keying
-	// on User.Subject, so it is refused rather than passed through.
-	if strings.HasPrefix(idToken.Subject, "local:") {
-		return nil, errors.New(`the id_token subject starts with "local:", which is reserved for the built-in account`)
-	}
 	name := c.PreferredUsername
 	if name == "" {
 		name = c.Name
 	}
-	u := newSessionUser(idToken.Subject, name, c.Email, c.Groups, false)
+	u := newSessionUser(idToken.Subject, name, c.Email, c.Groups)
 	if u == nil {
 		return nil, errors.New("the id_token has no subject")
 	}
@@ -641,9 +479,9 @@ func (g *Gate) oidcUser(ctx context.Context, s *oidcState, tok *oauth2.Token, id
 	return u, nil
 }
 
-// loginFail logs the detail and sends the browser to the sign-in page with a
-// generic error code, where it shows the fallback (local form and/or a retry
-// button) instead of redirecting again.
+// loginFail logs the detail and sends the browser to the fallback page with a
+// generic error code, where it shows a retry button instead of redirecting
+// again.
 func (g *Gate) loginFail(w http.ResponseWriter, r *http.Request, code, next, detail string) {
 	g.log.Warn("auth: oidc login not completed", "code", code, "reason", detail)
 	http.Redirect(w, r, loginPath+"?error="+code+"&next="+url.QueryEscape(next), http.StatusFound)
@@ -651,39 +489,26 @@ func (g *Gate) loginFail(w http.ResponseWriter, r *http.Request, code, next, det
 
 // --- logout --------------------------------------------------------------
 
-// handleLogout signs out only on a POST that passes the CSRF check: a GET shows
-// a confirmation page instead, so a third-party page cannot sign the user out
-// by making the browser follow a link.
+// handleLogout signs out, but never for another site: a request whose
+// Sec-Fetch-Site says it was caused cross-site is refused, so a third-party
+// page cannot sign the user out with a crafted link. Every current browser
+// sends the header; a client without it can at worst cause a sign-out, not a
+// sign-in.
 func (g *Gate) handleLogout(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
-	case http.MethodGet, http.MethodHead:
-		g.showLogout(w, r, http.StatusOK, "")
-	case http.MethodPost:
-		r.Body = http.MaxBytesReader(w, r.Body, 4096)
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		if !g.checkCSRF(r) {
-			g.showLogout(w, r, http.StatusForbidden, "Your session expired. Please try again.")
-			return
-		}
-		g.endSession(w, r)
-		w.Header().Set("Cache-Control", "no-store")
-		http.Redirect(w, r, loggedOutPath, http.StatusFound)
+	case http.MethodGet, http.MethodHead, http.MethodPost:
 	default:
 		w.Header().Set("Allow", "GET, HEAD, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
-}
-
-func (g *Gate) showLogout(w http.ResponseWriter, r *http.Request, status int, msg string) {
-	g.render(w, status, pageData{
-		Title: "Sign out", Heading: "Sign out",
-		Message: "Do you want to sign out?", Error: msg,
-		ShowLogout: true, CSRF: g.csrfToken(w, r),
-		Link: "/", LinkLabel: "Cancel",
-	})
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+		http.Error(w, "cross-site sign-out refused", http.StatusForbidden)
+		return
+	}
+	g.endSession(w, r)
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, loggedOutPath, http.StatusFound)
 }
 
 // handleLoggedOut shows a landing page rather than bouncing straight back into

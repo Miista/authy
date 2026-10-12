@@ -1,9 +1,9 @@
 # OIDC is configured, but the IdP is not running when the app starts (it is
 # under the "late" profile, so `up` leaves it out; the test starts it later).
 #
-# The app must start anyway, keep the local login working in the meantime (an
-# account is seeded as in with-account), and start sending page loads to the
-# IdP once it appears, without a restart. There is deliberately no depends_on.
+# The app must start anyway, explain on the fallback page that the provider is
+# not reachable, and start sending page loads to the IdP once it appears,
+# without a restart. There is deliberately no depends_on.
 services:
   fakeidp:
     image: oidcgate-fakeidp:integration
@@ -24,7 +24,6 @@ services:
     volumes:
       - ./data:/app/data
     environment:
-      DEMO_OIDC_ENABLED: "true"
       DEMO_OIDC_ISSUER: "http://fakeidp:8080"
       DEMO_OIDC_CLIENT_ID: "cid"
       DEMO_OIDC_CLIENT_SECRET: "csecret"

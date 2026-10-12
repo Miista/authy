@@ -1,7 +1,7 @@
-# OIDC configured from the start, no local account.
+# The gate as it usually runs: the IdP owns sign-in.
 #
-# The gate sends a page load straight to the IdP and does not create a local
-# account; setup is closed, so nobody can claim the app by being first.
+# The gate sends a page load straight to the IdP; what lands in the data
+# directory is only the session-signing key and sign-out records.
 #
 # Both services are reached by the names a browser on this network would use
 # (subject:8080, fakeidp:8080); the suite maps them to the published ports. The
@@ -28,7 +28,6 @@ services:
     volumes:
       - ./data:/app/data
     environment:
-      DEMO_OIDC_ENABLED: "true"
       DEMO_OIDC_ISSUER: "http://fakeidp:8080"
       DEMO_OIDC_CLIENT_ID: "cid"
       DEMO_OIDC_CLIENT_SECRET: "csecret"

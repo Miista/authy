@@ -13,9 +13,7 @@ import (
 // decide what each may do. Who may sign in at all is still decided at the
 // identity provider.
 type User struct {
-	// Subject is the provider's stable ID for the person (the "sub" claim). For
-	// the local account it is "local:" plus the username; an OIDC subject in
-	// that namespace is refused at sign-in, so the two can never collide.
+	// Subject is the provider's stable ID for the person (the "sub" claim).
 	Subject string
 	// Name is the person's username if the provider gave one, else their name,
 	// else their email, else the subject. It is for display and logs; it is not
@@ -23,10 +21,8 @@ type User struct {
 	Name  string
 	Email string
 	// Groups is the "groups" claim, which the provider only sends when the app
-	// asked for the "groups" scope (see WithScopes). Empty for the local account.
+	// asked for the "groups" scope (see WithScopes).
 	Groups []string
-	// Local is true for the account created on first launch.
-	Local bool
 }
 
 // InGroup reports whether the user is in the group (an exact, case-sensitive match).
@@ -71,21 +67,20 @@ type sessionUser struct {
 	Name   string   `json:"n,omitempty"`
 	Email  string   `json:"e,omitempty"`
 	Groups []string `json:"g,omitempty"`
-	Local  bool     `json:"l,omitempty"`
 }
 
 func (s *sessionUser) user() User {
-	return User{Subject: s.Sub, Name: s.Name, Email: s.Email, Groups: s.Groups, Local: s.Local}
+	return User{Subject: s.Sub, Name: s.Name, Email: s.Email, Groups: s.Groups}
 }
 
 // newSessionUser cleans what a provider sent. An empty subject yields nil: an
 // identity with no stable ID would let two people be mistaken for one.
-func newSessionUser(sub, name, email string, groups []string, local bool) *sessionUser {
+func newSessionUser(sub, name, email string, groups []string) *sessionUser {
 	sub = clean(sub, maxSubjectLen)
 	if sub == "" {
 		return nil
 	}
-	u := &sessionUser{Sub: sub, Name: clean(name, maxNameLen), Email: clean(email, maxEmailLen), Local: local}
+	u := &sessionUser{Sub: sub, Name: clean(name, maxNameLen), Email: clean(email, maxEmailLen)}
 	if u.Name == "" {
 		u.Name = u.Email
 	}
@@ -118,16 +113,6 @@ func clean(s string, max int) string {
 		return ""
 	}
 	return s
-}
-
-// localUser is the identity of the account made on first launch. The username
-// is what the person typed, which store.verify has just matched to the account.
-func localUser(username string) *sessionUser {
-	username = strings.TrimSpace(username)
-	if username == "" {
-		return nil
-	}
-	return newSessionUser("local:"+username, username, "", nil, true)
 }
 
 // scopesOrDefault is what is asked of the provider: the configured scopes, or

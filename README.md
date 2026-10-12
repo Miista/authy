@@ -1,8 +1,9 @@
 # oidcgate
 
-Login for any `net/http` Go app in two lines, configured by environment
-variables: a local account created on first launch, plus optional OpenID
-Connect (Authelia, Authentik, Keycloak, Entra ID, …).
+A drop-in OpenID Connect auth gate for any `net/http` Go app, configured by
+environment variables. Sign-in is your IdP's job (Authelia, Authentik,
+Keycloak, Entra ID, …); the gate is a relying party only, with no accounts,
+passwords or login form of its own.
 
 ```go
 gate, err := oidcgate.FromEnv(ctx, "myapp") // reads MYAPP_* env vars
@@ -12,10 +13,11 @@ if err != nil {
 handler = gate.Wrap(handler) // no-op when the gate is off
 ```
 
-The gate owns all of authentication: the login, setup and error pages, the
-local account, sessions, the OIDC flow and the routes under `/auth/`. The app
-has no code for any of it; remove the two lines and it has no idea an account
-ever existed.
+The gate owns all of authentication: the OIDC flow, sessions, sign-out and the
+routes under `/auth/`. The app has no code for any of it; remove the two lines
+and it has no idea any of it existed. Who may sign in is decided at the
+provider; the gate verifies the sign-in and records that the browser is
+authorized and who it is.
 
 It is **on by default**. An app that deliberately relies on something else
 (e.g. forward auth at a proxy) sets `MYAPP_AUTH_DISABLED=true`.
@@ -24,63 +26,49 @@ It is **on by default**. An app that deliberately relies on something else
 
 ```mermaid
 flowchart TD
-    Start([Start]) --> First{First launch?}
+    Start([Start]) --> Disc{Provider discovered?}
 
-    First -- Yes --> O1{OIDC configured?}
-    First -- No --> O2{OIDC configured?}
-
-    O1 -- Yes --> IdP[Redirect to IdP]
-    O2 -- Yes --> IdP
-    O1 -- No --> Create[Create local login]
-    O2 -- No --> Local{Local login enabled?}
+    Disc -- Yes --> IdP[Redirect to IdP]
+    Disc -- No --> Fallback[Fallback page: provider unreachable]
 
     IdP --> Approves{IdP approves login?}
     Approves -- Yes --> In([Logged in])
-    Approves -- No --> Local
+    Approves -- No --> Fail[Fallback page: sign-in failed, retry button]
 
-    Local -- Yes --> Login[Show login page]
-    Local -- No --> Err([Error])
-
-    Create --> In
-    Login --> In
+    Fallback --> Retry[Try again with OpenID Connect]
+    Fail --> Retry
+    Retry --> Disc
 
     classDef start fill:#2a5c36,stroke:#fff,color:#fff
     classDef ok fill:#22385c,stroke:#fff,color:#fff
     classDef bad fill:#5c2a2a,stroke:#fff,color:#fff
     class Start start
     class In ok
-    class Err bad
+    class Fail bad
 ```
 
-- **First launch** means no local account exists yet.
-- **Local login enabled** means it isn't turned off with
-  `MYAPP_OIDC_DISABLE_BUILT_IN_LOGIN`, and an account exists to sign in with
-  (so a rejected OIDC login on a first launch ends in the error page).
-- Page loads are redirected; `fetch`/XHR and API clients get
+- Page loads are redirected to the IdP; `fetch`/XHR and API clients get
   `401 {"error":"unauthorized"}`.
-- After a rejected OIDC login the gate shows a page and never redirects to the
-  IdP again, so a rejection cannot loop.
-- `/auth/login` is always reachable directly: the way in with the local account
-  when the IdP is down.
+- `/auth/login` is the GET-only fallback page: a "Sign in with OpenID Connect"
+  button, and the error after a failed or unavailable attempt. It never has a
+  form and never redirects, so a rejection at the IdP cannot loop.
 - An IdP that is unreachable at startup is not fatal. The gate retries in the
-  background and the local login works meanwhile.
-- With OIDC configured, setup is closed: nobody can claim the app by being first.
+  background and the fallback page says "not reachable" meanwhile.
 
 ## Configuration
 
 `<APP>` is the name passed to `FromEnv`, upper-cased, non-alphanumerics → `_`.
+The four OIDC variables are **required** unless the gate is disabled.
 
 | Variable | |
 |---|---|
 | `<APP>_AUTH_DISABLED` | `true`: no gate at all. |
 | `<APP>_AUTH_PUBLIC_PATHS` | Comma-separated paths that skip auth, added to `/healthz`. A trailing `/` makes a prefix. |
-| `<APP>_OIDC_ENABLED` | `true` turns OIDC on. Then all four below are required. |
 | `<APP>_OIDC_ISSUER` | IdP issuer URL, e.g. `https://auth.example.com`. |
 | `<APP>_OIDC_CLIENT_ID`, `_CLIENT_SECRET` | The client registered at the IdP. |
 | `<APP>_OIDC_BASE_URL` | The app's external URL, no path: `https://myapp.example.com`. |
-| `<APP>_OIDC_DISABLE_BUILT_IN_LOGIN` | `true`: OIDC is the only way in; the local form is hidden **and** refused by the server. Ignored (with a warning) without OIDC. |
 
-Missing OIDC settings or a malformed boolean make `FromEnv` return an error.
+Missing settings or a malformed boolean make `FromEnv` return an error.
 
 **At the IdP:** register a confidential client with redirect URI
 `<BASE_URL>/auth/callback` (logged at startup), scopes `openid profile email`
@@ -102,8 +90,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-`User` has `Subject` (the IdP's stable `sub`, or `local:<username>` for the local
-account), `Name` (for display, not an identifier), `Email`, `Groups` and `Local`.
+`User` has `Subject` (the IdP's stable `sub`), `Name` (for display, not an
+identifier), `Email` and `Groups`.
 
 - `WithScopes` is an option, not an environment variable: which scopes an app
   needs belongs to its code, not to a deployment. `openid` is always requested.
@@ -127,17 +115,14 @@ account), `Name` (for display, not an identifier), `Email`, `Groups` and `Local`
 
 ## State
 
-`/app/data/auth/auth.json` (directory `0700`, file `0600`): the account's
-username and **bcrypt hash**, and the key that signs session cookies. It lives
-in the app's existing `/app/data` volume, must be writable by the app's user
-(startup fails with a clear message if not), and can't be moved. Sessions are
-signed `HttpOnly`, `SameSite=Lax` cookies (`Secure` over HTTPS or
+`/app/data/auth/auth.json` (directory `0700`, file `0600`): the key that signs
+session cookies, and the revoked session IDs from sign-outs. It lives in the
+app's existing `/app/data` volume, must be writable by the app's user (startup
+fails with a clear message if not), and can't be moved. Sessions are signed
+`HttpOnly`, `SameSite=Lax` cookies (`Secure` over HTTPS or
 `X-Forwarded-Proto: https`) with a sliding 7-day life, and survive restarts.
 However often a session is renewed, it ends for good four lifetimes (28 days)
 after sign-in.
-
-**Forgot the password?** Stop the app, delete `auth.json`, start it again; the
-setup page returns. There is no password-change page.
 
 ## A Sign out button
 
@@ -151,8 +136,9 @@ only announces itself:
 <a class="only-with-gate" href="/auth/logout">Sign out</a>
 ```
 
-The link opens a confirmation page; the actual sign-out is a POST with a CSRF
-token, so another site can't sign your users out with a crafted link.
+The sign-out refuses cross-site requests (`Sec-Fetch-Site`), so another site
+can't sign your users out with a crafted link, and lands on a small "signed
+out" page rather than bouncing straight back into the IdP's single sign-on.
 
 `/auth/client.js` sets `document.documentElement.dataset.oidcgate = "on"`. With
 the gate off it is a 404, the attribute never appears, and everything marked
@@ -160,28 +146,26 @@ the gate off it is a 404, the attribute never appears, and everything marked
 
 ## Security
 
-bcrypt (cost 12, 8–72 bytes) with timing equalised for unknown users; local
-login rate-limited to 5 failures a minute, process-wide (OIDC unaffected);
-double-submit CSRF token plus `Sec-Fetch-Site`; OIDC with PKCE, `state`,
-`nonce` and full ID-token verification via
-[go-oidc](https://github.com/coreos/go-oidc); `?next=` accepted only as a local
-path and every redirect re-checked; static gate pages with a strict CSP and
-`no-store`. Tokens and secrets are never logged.
+OIDC with PKCE, `state`, `nonce` and full ID-token verification via
+[go-oidc](https://github.com/coreos/go-oidc); sign-out refused for cross-site
+requests (`Sec-Fetch-Site`); `?next=` accepted only as a local path and
+every redirect re-checked; static gate pages with a strict CSP and `no-store`.
+Tokens and secrets are never logged.
 
 This is security-critical code. It is tested (`-race`) and scanned (`gosec`,
 `govulncheck`) but has had no independent review.
 
 ## Limits
 
-One local account, no password change; `BASE_URL` can't contain a path; each
-host needs its own IdP client; it answers "who is signed in, and in which
-groups?", and leaves what each may do to the app.
+`BASE_URL` can't contain a path; each host needs its own IdP client; it answers
+"who is signed in, and in which groups?", and leaves what each may do to the
+app.
 
 Sessions are stateless cookies with a signed session ID. Signing out revokes
 that ID (persisted in `auth.json`), so **every copy of the cookie dies with the
 sign-out**, and no session outlives four lifetimes (28 days) after sign-in no
 matter how often it is renewed. To end every session at once, stop the app,
-delete `auth.json` (which also removes the account) and start it again.
+delete `auth.json` and start it again (the signing key rotates).
 
 ## Testing
 
@@ -192,5 +176,5 @@ delete `auth.json` (which also removes the account) and start it again.
 - `make scan`: `go vet`, `gosec`, `govulncheck`. Use the latest Go patch release.
 
 Options for the rare case the environment isn't enough: `WithPublicPaths`,
-`WithSessionTTL`, `WithLogger`, `WithDataDir`, or build a `Config` and call
-`oidcgate.New(ctx, cfg)`.
+`WithSessionTTL`, `WithScopes`, `WithLogger`, `WithDataDir`, or build a
+`Config` and call `oidcgate.New(ctx, cfg)`.

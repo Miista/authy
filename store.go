@@ -2,54 +2,35 @@ package oidcgate
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
-
-	"golang.org/x/crypto/bcrypt"
 )
 
-// bcryptCost is a variable only so tests can lower it; nothing else changes it.
-var bcryptCost = 12
-
-const (
-	storeFile    = "auth.json"
-	minPassword  = 8
-	maxPassword  = 72 // bcrypt silently ignores bytes past 72, so refuse them instead
-	maxUsernameN = 64
-)
-
-var errAccountExists = errors.New("an account already exists")
+const storeFile = "auth.json"
 
 // storeData is persisted as auth.json (0600) inside the 0700 data directory.
 type storeData struct {
-	Username     string `json:"username,omitempty"`
-	PasswordHash string `json:"password_hash,omitempty"`
-	SessionKey   string `json:"session_key"` // base64; signs session cookies
+	SessionKey string `json:"session_key"` // base64; signs session cookies
 	// Revoked are signed-out session IDs and when each may be forgotten (the
 	// session's absolute end, as a Unix time). Persisted so a sign-out holds
 	// across restarts; pruned on every revocation.
 	Revoked map[string]int64 `json:"revoked,omitempty"`
 }
 
-// store holds the single local account and the key that signs sessions.
-// Creating the account rotates the key, which ends every earlier session.
+// store holds the key that signs sessions and the sign-out records. Deleting
+// auth.json and restarting rotates the key, which ends every session at once.
 type store struct {
 	path string
 
 	mu   sync.RWMutex
 	data storeData
 	key  []byte
-
-	dummyHash []byte // compared against when the username is wrong, to equalise timing
 }
 
 func openStore(dir string) (*store, error) {
@@ -79,17 +60,7 @@ func openStore(dir string) (*store, error) {
 	default:
 		return nil, err
 	}
-
-	if s.dummyHash, err = bcrypt.GenerateFromPassword([]byte("oidcgate-timing-equaliser"), bcryptCost); err != nil {
-		return nil, err
-	}
 	return s, nil
-}
-
-func (s *store) hasAccount() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.data.Username != ""
 }
 
 func (s *store) sessionKey() []byte {
@@ -122,70 +93,6 @@ func (s *store) isRevoked(sid string) bool {
 	defer s.mu.RUnlock()
 	exp, ok := s.data.Revoked[sid]
 	return ok && exp > time.Now().Unix()
-}
-
-// createAccount stores the single account. It fails if one already exists, so
-// two simultaneous setups cannot both win.
-func (s *store) createAccount(username, password string) error {
-	username = strings.TrimSpace(username)
-	if err := validateCredentials(username, password); err != nil {
-		return err
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
-	if err != nil {
-		return err
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.data.Username != "" {
-		return errAccountExists
-	}
-	prev := s.data
-	prevKey := s.key
-	s.data.Username, s.data.PasswordHash = username, string(hash)
-	if err := s.rotateKeyLocked(); err != nil {
-		s.data, s.key = prev, prevKey
-		return err
-	}
-	if err := s.saveLocked(); err != nil {
-		s.data, s.key = prev, prevKey
-		return err
-	}
-	return nil
-}
-
-// verify checks a username and password. It does the same bcrypt work whether
-// or not the username matches, so timing does not reveal the username.
-func (s *store) verify(username, password string) bool {
-	s.mu.RLock()
-	stored, hash := s.data.Username, []byte(s.data.PasswordHash)
-	s.mu.RUnlock()
-	if stored == "" {
-		return false
-	}
-	userOK := subtle.ConstantTimeCompare([]byte(strings.TrimSpace(username)), []byte(stored)) == 1
-	if !userOK {
-		hash = s.dummyHash
-	}
-	passOK := bcrypt.CompareHashAndPassword(hash, []byte(password)) == nil
-	return userOK && passOK
-}
-
-func validateCredentials(username, password string) error {
-	switch {
-	case username == "":
-		return errors.New("Enter a username.")
-	case utf8.RuneCountInString(username) > maxUsernameN:
-		return fmt.Errorf("The username can be at most %d characters.", maxUsernameN)
-	case strings.ContainsAny(username, "\x00\r\n\t"):
-		return errors.New("The username contains characters that are not allowed.")
-	case len(password) < minPassword:
-		return fmt.Errorf("The password must be at least %d characters.", minPassword)
-	case len(password) > maxPassword:
-		return fmt.Errorf("The password can be at most %d bytes.", maxPassword)
-	}
-	return nil
 }
 
 func (s *store) rotateKeyLocked() error {

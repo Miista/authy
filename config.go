@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// defaultDataDir is where the account and the session-signing key live. Every
+// defaultDataDir is where the session-signing key and sign-out records live. Every
 // app in this stack already mounts /app/data, so the gate needs no extra volume.
 const defaultDataDir = "/app/data/auth"
 
@@ -21,16 +21,13 @@ type Config struct {
 	// apps on one host (different ports) never read each other's sessions.
 	App string
 
-	// OIDC turns on login through an OpenID Connect provider. Nil means the
-	// gate offers only the local account.
+	// OIDC is the OpenID Connect provider that owns sign-in. It is required:
+	// the gate is a relying party only and has no login of its own, so who may
+	// sign in, and how, is entirely the provider's business.
 	OIDC *OIDCConfig
 
-	// DisableBuiltInLogin hides and refuses the local login, so OIDC is the
-	// only way in. It has no effect (and logs a warning) without OIDC, so a
-	// stray flag can never lock everyone out.
-	DisableBuiltInLogin bool
-
-	// DataDir holds auth.json (account + signing key). Default /app/data/auth.
+	// DataDir holds auth.json (the session-signing key and sign-out records).
+	// Default /app/data/auth.
 	DataDir string
 
 	// SessionTTL is the sliding session lifetime. Default 7 days.
@@ -89,30 +86,28 @@ func WithScopes(scopes ...string) Option {
 // WithLogger sets the logger. Default: slog.Default().
 func WithLogger(l *slog.Logger) Option { return func(c *Config) { c.Logger = l } }
 
-// WithDataDir overrides where the account and signing key are stored.
+// WithDataDir overrides where the signing key and sign-out records are stored.
 func WithDataDir(dir string) Option { return func(c *Config) { c.DataDir = dir } }
 
 // FromEnv builds a Gate for an app from <APP>_* environment variables, where
 // <APP> is app upper-cased with non-alphanumerics replaced by "_".
 //
-// The gate is ON by default: the first visitor creates a local account, and
-// every later visit needs it. Optional OIDC login sits alongside:
+// The gate is ON by default and sign-in is the OIDC provider's, so the four
+// OIDC variables are required unless the gate is disabled:
 //
-//	<APP>_AUTH_DISABLED               true: no gate at all, FromEnv returns nil
-//	                                  (for apps deliberately behind forward auth)
-//	<APP>_AUTH_PUBLIC_PATHS           comma-separated paths that skip auth, added to /healthz
-//	<APP>_OIDC_ENABLED                true turns OIDC login on
-//	<APP>_OIDC_ISSUER                 required when OIDC is enabled
-//	<APP>_OIDC_CLIENT_ID              required when OIDC is enabled
-//	<APP>_OIDC_CLIENT_SECRET          required when OIDC is enabled
-//	<APP>_OIDC_BASE_URL               required when OIDC is enabled
-//	<APP>_OIDC_DISABLE_BUILT_IN_LOGIN true: OIDC is the only way in (needs OIDC enabled)
+//	<APP>_AUTH_DISABLED     true: no gate at all, FromEnv returns nil
+//	                        (for apps deliberately behind forward auth)
+//	<APP>_AUTH_PUBLIC_PATHS comma-separated paths that skip auth, added to /healthz
+//	<APP>_OIDC_ISSUER       the provider, e.g. https://auth.example.com
+//	<APP>_OIDC_CLIENT_ID
+//	<APP>_OIDC_CLIENT_SECRET
+//	<APP>_OIDC_BASE_URL     this app's external URL
 //
 // (*Gate)(nil).Wrap is a no-op, so the same two lines work with the gate on
 // or off. Malformed or incomplete settings are an error: the caller should
 // refuse to start rather than serve unprotected. An OIDC provider that is
 // merely unreachable is not an error; the gate retries in the background and
-// the local login keeps working meanwhile.
+// serves "try again" meanwhile.
 func FromEnv(ctx context.Context, app string, opts ...Option) (*Gate, error) {
 	p := envPrefix(app) + "_"
 
@@ -127,34 +122,25 @@ func FromEnv(ctx context.Context, app string, opts ...Option) (*Gate, error) {
 
 	cfg := Config{App: app}
 
-	oidcOn, err := envBool(p + "OIDC_ENABLED")
-	if err != nil {
-		return nil, err
+	o := &OIDCConfig{
+		Issuer:       strings.TrimSpace(os.Getenv(p + "OIDC_ISSUER")),
+		ClientID:     strings.TrimSpace(os.Getenv(p + "OIDC_CLIENT_ID")),
+		ClientSecret: os.Getenv(p + "OIDC_CLIENT_SECRET"),
+		BaseURL:      strings.TrimSpace(os.Getenv(p + "OIDC_BASE_URL")),
 	}
-	if oidcOn {
-		o := &OIDCConfig{
-			Issuer:       strings.TrimSpace(os.Getenv(p + "OIDC_ISSUER")),
-			ClientID:     strings.TrimSpace(os.Getenv(p + "OIDC_CLIENT_ID")),
-			ClientSecret: os.Getenv(p + "OIDC_CLIENT_SECRET"),
-			BaseURL:      strings.TrimSpace(os.Getenv(p + "OIDC_BASE_URL")),
+	var missing []string
+	for _, v := range []struct{ name, val string }{
+		{"ISSUER", o.Issuer}, {"CLIENT_ID", o.ClientID}, {"CLIENT_SECRET", o.ClientSecret}, {"BASE_URL", o.BaseURL},
+	} {
+		if v.val == "" {
+			missing = append(missing, p+"OIDC_"+v.name)
 		}
-		var missing []string
-		for _, v := range []struct{ name, val string }{
-			{"ISSUER", o.Issuer}, {"CLIENT_ID", o.ClientID}, {"CLIENT_SECRET", o.ClientSecret}, {"BASE_URL", o.BaseURL},
-		} {
-			if v.val == "" {
-				missing = append(missing, p+"OIDC_"+v.name)
-			}
-		}
-		if len(missing) > 0 {
-			return nil, fmt.Errorf("auth: OIDC enabled but missing %s", strings.Join(missing, ", "))
-		}
-		cfg.OIDC = o
 	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("auth: missing %s (or set %sAUTH_DISABLED=true)", strings.Join(missing, ", "), p)
+	}
+	cfg.OIDC = o
 
-	if cfg.DisableBuiltInLogin, err = envBool(p + "OIDC_DISABLE_BUILT_IN_LOGIN"); err != nil {
-		return nil, err
-	}
 	for _, path := range strings.Split(os.Getenv(p+"AUTH_PUBLIC_PATHS"), ",") {
 		if path = strings.TrimSpace(path); path != "" {
 			cfg.PublicPaths = append(cfg.PublicPaths, path)

@@ -17,7 +17,6 @@ type who struct {
 		Name    string
 		Email   string
 		Groups  []string
-		Local   bool
 	} `json:"user"`
 }
 
@@ -48,46 +47,13 @@ func signInOIDC(t *testing.T, app string) *http.Client {
 	return c
 }
 
-func sessionPayload(t *testing.T, c *http.Client, app string, g *Gate) string {
-	t.Helper()
-	u, _ := url.Parse(app)
-	for _, ck := range c.Jar.Cookies(u) {
-		if ck.Name == g.sessionCookie {
-			p, _, _ := strings.Cut(ck.Value, ".")
-			b, _ := base64.RawURLEncoding.DecodeString(p)
-			return string(b)
-		}
-	}
-	t.Fatal("no session cookie")
-	return ""
-}
-
-func TestLocalAccountIsAUserWithNoGroups(t *testing.T) {
-	app, g := startApp(t, Config{})
-	c := signedIn(t, app, g)
-	w, code := whoami(t, c, app.URL)
-	if code != 200 || !w.OK || w.User.Subject != "local:alice" || w.User.Name != "alice" || !w.User.Local || len(w.User.Groups) != 0 {
-		t.Errorf("%d %+v", code, w)
-	}
-}
-
-func TestFirstLaunchSetupSignsTheNewAccountIn(t *testing.T) {
-	app, _ := startApp(t, Config{})
-	c := browser()
-	tok := formToken(t, c, app.URL+"/auth/setup")
-	do(t, c, "POST", app.URL+"/auth/setup", url.Values{"username": {"owner"}, "password": {"correct horse"}, "confirm": {"correct horse"}, "csrf": {tok}}, nil)
-	if w, _ := whoami(t, c, app.URL); !w.OK || w.User.Name != "owner" || !w.User.Local {
-		t.Errorf("%+v", w)
-	}
-}
-
 func TestOIDCUserFromTheIDTokenWithoutAskingUserInfo(t *testing.T) {
 	idp := newFakeIdP(t)
 	idp.idClaims = map[string]any{"preferred_username": "alice", "groups": []string{"admins", "users"}}
 	idp.Start()
 	app, _ := oidcApp(t, idp, "openid", "profile", "email", "groups")
 	w, code := whoami(t, signInOIDC(t, app), app)
-	if code != 200 || !w.OK || w.User.Subject != "user-1" || w.User.Name != "alice" || w.User.Email != "a@example.com" || w.User.Local {
+	if code != 200 || !w.OK || w.User.Subject != "user-1" || w.User.Name != "alice" || w.User.Email != "a@example.com" {
 		t.Fatalf("%d %+v", code, w)
 	}
 	if strings.Join(w.User.Groups, ",") != "admins,users" {
@@ -206,9 +172,10 @@ func TestTheIdentityIsSignedAndCannotBeEdited(t *testing.T) {
 }
 
 func TestIdentitySurvivesTheSlidingRefresh(t *testing.T) {
-	app, g := startApp(t, Config{SessionTTL: time.Hour})
-	g.ttl = time.Hour
-	su := newSessionUser("user-1", "alice", "a@example.com", []string{"admins"}, false)
+	idp := newFakeIdP(t)
+	idp.Start()
+	app, g := startApp(t, Config{SessionTTL: time.Hour, OIDC: oidcCfg(idp)})
+	su := newSessionUser("user-1", "alice", "a@example.com", []string{"admins"})
 	old := g.seal(purposeSession, sessionClaims{Exp: time.Now().Add(10 * time.Minute).Unix(), U: su}) // under half left
 	u, _ := url.Parse(app.URL)
 	c := browser()
@@ -229,8 +196,7 @@ func TestIdentitySurvivesTheSlidingRefresh(t *testing.T) {
 }
 
 func TestASessionFromBeforeIdentitiesIsStillValidButHasNoUser(t *testing.T) {
-	app, g := startApp(t, Config{})
-	g.store.createAccount("alice", "correct horse")
+	app, g, _ := startOIDCApp(t)
 	old := g.seal(purposeSession, sessionClaims{Exp: time.Now().Add(time.Hour).Unix()})
 	u, _ := url.Parse(app.URL)
 	c := browser()
@@ -242,8 +208,10 @@ func TestASessionFromBeforeIdentitiesIsStillValidButHasNoUser(t *testing.T) {
 }
 
 func TestNobodyOnAPublicPath(t *testing.T) {
-	app, g := startApp(t, Config{PublicPaths: []string{"/whoami"}})
-	c := signedIn(t, app, g)
+	idp := newFakeIdP(t)
+	idp.Start()
+	app, _ := startApp(t, Config{PublicPaths: []string{"/whoami"}, OIDC: oidcCfg(idp)})
+	c := signedIn(t, app)
 	if w, code := whoami(t, c, app.URL); code != 200 || w.OK {
 		t.Errorf("a public path skips the gate, so it must not claim to know the user: %d %+v", code, w)
 	}
@@ -265,7 +233,7 @@ func TestEntriesAreCleanedBeforeTheyGoIntoACookie(t *testing.T) {
 		many = append(many, "group-"+strings.Repeat("x", i%5)+string(rune('a'+i%26))+strings.Repeat("y", i))
 	}
 	long := strings.Repeat("z", maxGroupLen+1)
-	u := newSessionUser("user-1", "  ali\nce\t ", "a@example.com", append([]string{"admins", "admins", "", long, "ad\x00mins2"}, many...), false)
+	u := newSessionUser("user-1", "  ali\nce\t ", "a@example.com", append([]string{"admins", "admins", "", long, "ad\x00mins2"}, many...))
 	if u.Name != "alice" {
 		t.Errorf("name = %q", u.Name)
 	}
@@ -289,13 +257,10 @@ func TestEntriesAreCleanedBeforeTheyGoIntoACookie(t *testing.T) {
 }
 
 func TestAnIdentityWithoutASubjectIsRefused(t *testing.T) {
-	if newSessionUser("", "x", "a@b", nil, false) != nil || newSessionUser("  \n", "x", "", nil, false) != nil {
+	if newSessionUser("", "x", "a@b", nil) != nil || newSessionUser("  \n", "x", "", nil) != nil {
 		t.Error("two people with no stable ID could be mistaken for one")
 	}
-	if localUser("") != nil || localUser("   ") != nil {
-		t.Error("an empty local username must not make a user")
-	}
-	if newSessionUser("s", "", "", nil, false).Name != "s" {
+	if newSessionUser("s", "", "", nil).Name != "s" {
 		t.Error("the name should fall back to the subject")
 	}
 }
