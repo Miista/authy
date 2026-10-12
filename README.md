@@ -144,6 +144,46 @@ out" page rather than bouncing straight back into the IdP's single sign-on.
 the gate off it is a 404, the attribute never appears, and everything marked
 `only-with-gate` stays hidden.
 
+## Apps that want a local account
+
+`oidcgate` is OIDC enablement and nothing else: no accounts, no passwords, no
+login form. An app that also wants a local account (say, a break-glass login for
+when the IdP is down) builds that itself, with its own pages and its own
+session. It doesn't need anything from the gate, because `Wrap` is ordinary
+middleware and the app can put its own check in front of it:
+
+```go
+guarded := gate.Wrap(mux)
+handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case strings.HasPrefix(r.URL.Path, "/auth/"):
+		guarded.ServeHTTP(w, r) // the gate's routes, including the OIDC callback
+	case local.OwnsPath(r.URL.Path): // the app's own login page and POST
+		mux.ServeHTTP(w, r)
+	case local.LoggedIn(r): // the app's own session is valid: skip the gate
+		mux.ServeHTTP(w, r)
+	default:
+		guarded.ServeHTTP(w, r) // everyone else signs in with OIDC
+	}
+})
+```
+
+What to know before doing this:
+
+- **The app's check is authoritative** for the requests it lets through: a bug
+  in it is a bypass of everything, the gate included. Keep it small and test it.
+- **Use a different session cookie name** from the gate's (`<app>_session`).
+- **Sign out is the app's job** for a locally signed-in user: the gate's
+  `/auth/logout` clears only the gate's cookie. Clear the app's session first,
+  then send the browser to `/auth/logout`.
+- **`UserFrom` is empty** for requests that skip the gate; take identity from
+  the app's own session on those.
+- **The local login is not advertised.** An unauthenticated page load goes
+  straight to the IdP, and the fallback page has no link to the app's own login,
+  so users need its URL (or the app links to it from somewhere else).
+- If the gate is off (`<APP>_AUTH_DISABLED=true`), `gate` is nil and `Wrap` is a
+  no-op; the same composition still works.
+
 ## Security
 
 OIDC with PKCE, `state`, `nonce` and full ID-token verification via
