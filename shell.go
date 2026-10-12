@@ -31,12 +31,16 @@ type gateShell struct {
 // would let two people be mistaken for one. The local namespace is enforced in
 // both directions: only the local method may use it, and it must.
 func (s *gateShell) SignIn(w http.ResponseWriter, r *http.Request, id shell.Identity, next string) error {
-	if (s.ns == "local") != strings.HasPrefix(id.Subject, localNamespace) {
-		return errors.New(`the subject is outside the method's namespace ("local:" is the local account's)`)
-	}
 	u := newSessionUser(id.Subject, id.Name, id.Email, id.Groups)
 	if u == nil {
 		return errors.New("the identity has no usable subject")
+	}
+	// The namespace is checked on the cleaned subject — the one that enters
+	// the session — never the raw one: cleaning trims whitespace and control
+	// characters, so " local:admin" from a provider would otherwise pass the
+	// raw check and still normalise into the local namespace.
+	if (s.ns == "local") != strings.HasPrefix(u.Sub, localNamespace) {
+		return errors.New(`the subject is outside the method's namespace ("local:" is the local account's)`)
 	}
 	if len(id.Groups) > len(u.Groups) {
 		s.g.log.Warn("auth: some groups were dropped (too many or too long)", "sub", u.Sub, "sent", len(id.Groups), "kept", len(u.Groups))
@@ -61,14 +65,14 @@ func (s *gateShell) Seal(purpose string, v any) string {
 	if purpose == purposeSession {
 		panic("authy: methods must not seal sessions; use SignIn")
 	}
-	return s.g.seal(purpose, v)
+	return s.g.seal(s.ns+":"+purpose, v)
 }
 
 func (s *gateShell) Open(purpose, sealed string, v any) bool {
 	if purpose == purposeSession {
 		panic("authy: methods must not open sessions")
 	}
-	return s.g.open(purpose, sealed, v)
+	return s.g.open(s.ns+":"+purpose, sealed, v)
 }
 
 func (s *gateShell) SetCookie(w http.ResponseWriter, r *http.Request, name, value, path string, maxAge time.Duration) {

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
@@ -122,7 +123,9 @@ func validateCredentials(username, password string) error {
 		return errors.New("Enter a username.")
 	case utf8.RuneCountInString(username) > maxUsernameN:
 		return fmt.Errorf("The username can be at most %d characters.", maxUsernameN)
-	case strings.ContainsAny(username, "\x00\r\n\t"):
+	case !utf8.ValidString(username) || strings.ContainsFunc(username, unicode.IsControl):
+		// The shell strips control characters from the subject it seals, so a
+		// username containing any would diverge from its own session identity.
 		return errors.New("The username contains characters that are not allowed.")
 	case len(password) < minPassword:
 		return fmt.Errorf("The password must be at least %d characters.", minPassword)

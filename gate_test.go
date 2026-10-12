@@ -670,19 +670,23 @@ func TestOIDCRejections(t *testing.T) {
 		// An IdP token whose sub is literally "local:admin" must not become a
 		// session that collides with the local account: the shell enforces the
 		// namespace, whatever the method hands over.
-		idp := newFakeIdP(t)
-		idp.idClaims = map[string]any{"sub": "local:admin"}
-		idp.Start()
-		app, g := startApp(t, Config{OIDC: oidcCfg(idp)})
-		c := browser()
-		res, body := get(t, c, app.URL+"/", nav)
-		if res.Request.URL.Path != "/auth/login" || !strings.Contains(res.Request.URL.RawQuery, "error=failed") || body == "hello app" {
-			t.Errorf("a local: subject from the IdP must fail sign-in: %d at %s", res.StatusCode, res.Request.URL)
-		}
-		u, _ := url.Parse(app.URL)
-		for _, ck := range c.Jar.Cookies(u) {
-			if ck.Name == g.sessionCookie {
-				t.Error("the rejected namespace must not set a session")
+		// " local:admin" covers the trap of checking the raw subject: cleaning
+		// trims it into the namespace after a raw-prefix check would have passed.
+		for _, sub := range []string{"local:admin", " local:admin", "\tlocal:admin"} {
+			idp := newFakeIdP(t)
+			idp.idClaims = map[string]any{"sub": sub}
+			idp.Start()
+			app, g := startApp(t, Config{OIDC: oidcCfg(idp)})
+			c := browser()
+			res, body := get(t, c, app.URL+"/", nav)
+			if res.Request.URL.Path != "/auth/login" || !strings.Contains(res.Request.URL.RawQuery, "error=failed") || body == "hello app" {
+				t.Errorf("sub %q from the IdP must fail sign-in: %d at %s", sub, res.StatusCode, res.Request.URL)
+			}
+			u, _ := url.Parse(app.URL)
+			for _, ck := range c.Jar.Cookies(u) {
+				if ck.Name == g.sessionCookie {
+					t.Error("the rejected namespace must not set a session")
+				}
 			}
 		}
 	})
