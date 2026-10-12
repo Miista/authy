@@ -54,9 +54,11 @@ flowchart TD
   visitor creates the single account on `/auth/setup`, every later visit signs
   in on `/auth/local`. No OIDC *and* `LOCAL_ENABLED=false` is a configuration
   error: the gate refuses to start rather than serve unprotected.
-- **OIDC configured** → page loads go straight to the IdP, and **setup stays
-  closed**: nobody can claim the app by being first. `fetch`/XHR and API
-  clients get `401 {"error":"unauthorized"}`.
+- **OIDC configured and local login not enabled** → page loads go straight to
+  the IdP, and **setup stays closed**: nobody can claim the app by being first.
+  (`LOCAL_ENABLED=true` reopens setup until the account exists — claim it
+  before exposing the app.) `fetch`/XHR and API clients get
+  `401 {"error":"unauthorized"}`.
 - **When the IdP rejects (or is unreachable)**: with `<APP>_LOCAL_ENABLED=true`
   the fallback page also offers the local account — the escape hatch; without
   it, the page offers only a retry, never a loop.

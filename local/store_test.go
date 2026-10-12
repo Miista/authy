@@ -8,13 +8,14 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/miista/authy/internal/testhook"
 )
 
 // TestMain lowers the bcrypt cost: at the production cost every hash takes
-// noticeable time, especially under the race detector. Only this package can
-// touch bcryptCost, which keeps it that way.
+// noticeable time, especially under the race detector.
 func TestMain(m *testing.M) {
-	bcryptCost = bcrypt.MinCost
+	testhook.BcryptCost = bcrypt.MinCost
 	os.Exit(m.Run())
 }
 

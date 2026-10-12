@@ -13,10 +13,9 @@ import (
 	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
-)
 
-// bcryptCost is a variable only so tests can lower it; nothing else changes it.
-var bcryptCost = 12
+	"github.com/miista/authy/internal/testhook"
+)
 
 const (
 	storeFile    = "local.json"
@@ -65,7 +64,7 @@ func openStore(dir string) (*store, error) {
 		return nil, err
 	}
 
-	if s.dummyHash, err = bcrypt.GenerateFromPassword([]byte("authy-timing-equaliser"), bcryptCost); err != nil {
+	if s.dummyHash, err = bcrypt.GenerateFromPassword([]byte("authy-timing-equaliser"), testhook.BcryptCost); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -84,7 +83,7 @@ func (s *store) createAccount(username, password string) error {
 	if err := validateCredentials(username, password); err != nil {
 		return err
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), testhook.BcryptCost)
 	if err != nil {
 		return err
 	}

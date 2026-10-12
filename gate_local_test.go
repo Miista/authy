@@ -1,17 +1,28 @@
 package authy
 
-// The local-account method through the gate, over HTTP only: these tests run
-// at the production bcrypt cost (the cost variable belongs to package local),
-// so they create at most one account each and never wait out the limiter.
+// The local-account method through the gate, over HTTP only.
 
 import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/bcrypt"
+
+	"github.com/miista/authy/internal/testhook"
 )
+
+// TestMain lowers the bcrypt cost for the whole package: at the production
+// cost every account creation takes noticeable time, especially under the
+// race detector.
+func TestMain(m *testing.M) {
+	testhook.BcryptCost = bcrypt.MinCost
+	os.Exit(m.Run())
+}
 
 var csrfRe = regexp.MustCompile(`name="csrf" value="([^"]+)"`)
 
