@@ -442,7 +442,7 @@ func TestSessionCookieValidation(t *testing.T) {
 		"forged key":  other.seal(purposeSession, sessionClaims{Exp: time.Now().Add(time.Hour).Unix()}),
 		"tampered":    "e30" + valid[strings.Index(valid, "."):],
 		"expired":     g.seal(purposeSession, sessionClaims{Exp: time.Now().Add(-time.Minute).Unix()}),
-		"wrong kind":  g.seal(purposeFlow, sessionClaims{Exp: time.Now().Add(time.Hour).Unix()}),
+		"wrong kind":  g.seal("flow", sessionClaims{Exp: time.Now().Add(time.Hour).Unix()}),
 		"garbage":     "nonsense",
 		"empty parts": ".",
 	} {
@@ -666,6 +666,26 @@ func TestOIDCRejections(t *testing.T) {
 			}
 		}
 	})
+	t.Run("subject in the local namespace", func(t *testing.T) {
+		// An IdP token whose sub is literally "local:admin" must not become a
+		// session that collides with the local account: the shell enforces the
+		// namespace, whatever the method hands over.
+		idp := newFakeIdP(t)
+		idp.idClaims = map[string]any{"sub": "local:admin"}
+		idp.Start()
+		app, g := startApp(t, Config{OIDC: oidcCfg(idp)})
+		c := browser()
+		res, body := get(t, c, app.URL+"/", nav)
+		if res.Request.URL.Path != "/auth/login" || !strings.Contains(res.Request.URL.RawQuery, "error=failed") || body == "hello app" {
+			t.Errorf("a local: subject from the IdP must fail sign-in: %d at %s", res.StatusCode, res.Request.URL)
+		}
+		u, _ := url.Parse(app.URL)
+		for _, ck := range c.Jar.Cookies(u) {
+			if ck.Name == g.sessionCookie {
+				t.Error("the rejected namespace must not set a session")
+			}
+		}
+	})
 	t.Run("flow cookie is not a session", func(t *testing.T) {
 		app, g, _ := startOIDCApp(t)
 		c := noRedirect(browser())
@@ -726,15 +746,19 @@ func TestFromEnv(t *testing.T) {
 			t.Error("a nil gate must return the handler unchanged")
 		}
 	})
-	t.Run("without OIDC settings FromEnv refuses", func(t *testing.T) {
-		_, err := FromEnv(ctx, "my-app", append(opts, dir(t))...)
-		if err == nil {
-			t.Fatal("expected an error: the OIDC settings are required")
+	t.Run("without OIDC settings the local account is the way in", func(t *testing.T) {
+		g, err := FromEnv(ctx, "my-app", append(opts, dir(t))...)
+		if err != nil || g == nil {
+			t.Fatalf("got %v, %v", g, err)
 		}
-		for _, v := range []string{"MY_APP_OIDC_ISSUER", "MY_APP_OIDC_CLIENT_ID", "MY_APP_OIDC_CLIENT_SECRET", "MY_APP_OIDC_BASE_URL", "MY_APP_AUTH_DISABLED"} {
-			if !strings.Contains(err.Error(), v) {
-				t.Errorf("error should name %s: %v", v, err)
-			}
+		if len(g.methods) != 1 || !g.methods[0].Ready() {
+			t.Fatalf("expected the local method alone, got %d methods", len(g.methods))
+		}
+	})
+	t.Run("local disabled without OIDC refuses", func(t *testing.T) {
+		t.Setenv("MY_APP_LOCAL_ENABLED", "false")
+		if _, err := FromEnv(ctx, "my-app", append(opts, dir(t))...); err == nil {
+			t.Fatal("expected an error: there is no way to sign in")
 		}
 	})
 	t.Run("invalid boolean", func(t *testing.T) {
@@ -770,6 +794,32 @@ func TestFromEnv(t *testing.T) {
 			t.Fatalf("got %v, %v", g, err)
 		}
 	})
+	t.Run("LOCAL_ENABLED stacks the local account next to OIDC", func(t *testing.T) {
+		idp := newFakeIdP(t)
+		idp.Start()
+		t.Setenv("MY_APP_OIDC_ISSUER", idp.URL)
+		t.Setenv("MY_APP_OIDC_CLIENT_ID", "cid")
+		t.Setenv("MY_APP_OIDC_CLIENT_SECRET", "csecret")
+		t.Setenv("MY_APP_OIDC_BASE_URL", "http://localhost:8080")
+		t.Setenv("MY_APP_LOCAL_ENABLED", "true")
+		g, err := FromEnv(ctx, "my-app", append(opts, dir(t))...)
+		if err != nil || g == nil || len(g.methods) != 2 {
+			t.Fatalf("expected OIDC plus the local account, got %v, %v", g, err)
+		}
+	})
+	t.Run("LOCAL_ENABLED=false with OIDC keeps OIDC alone", func(t *testing.T) {
+		idp := newFakeIdP(t)
+		idp.Start()
+		t.Setenv("MY_APP_OIDC_ISSUER", idp.URL)
+		t.Setenv("MY_APP_OIDC_CLIENT_ID", "cid")
+		t.Setenv("MY_APP_OIDC_CLIENT_SECRET", "csecret")
+		t.Setenv("MY_APP_OIDC_BASE_URL", "http://localhost:8080")
+		t.Setenv("MY_APP_LOCAL_ENABLED", "false")
+		g, err := FromEnv(ctx, "my-app", append(opts, dir(t))...)
+		if err != nil || g == nil || len(g.methods) != 1 {
+			t.Fatalf("expected OIDC alone, got %v, %v", g, err)
+		}
+	})
 	t.Run("complete OIDC config with public paths", func(t *testing.T) {
 		idp := newFakeIdP(t)
 		idp.Start()
@@ -802,8 +852,9 @@ func TestNewValidation(t *testing.T) {
 	good := func() Config {
 		return Config{App: "a", DataDir: t.TempDir(), Logger: quiet, OIDC: &OIDCConfig{Issuer: idp.URL, ClientID: "c", ClientSecret: "s", BaseURL: "http://localhost:1"}}
 	}
+	off := false
 	for name, mutate := range map[string]func(*Config){
-		"no OIDC at all":     func(c *Config) { c.OIDC = nil },
+		"no way in at all":   func(c *Config) { c.OIDC, c.LocalLogin = nil, &off },
 		"no issuer":          func(c *Config) { c.OIDC.Issuer = "" },
 		"base url with path": func(c *Config) { c.OIDC.BaseURL = "https://x.example.com/app" },
 		"base url relative":  func(c *Config) { c.OIDC.BaseURL = "x.example.com" },

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/miista/authy/internal/shell"
+	"github.com/miista/authy/local"
 	"github.com/miista/authy/oidc"
 )
 
@@ -48,6 +49,7 @@ type Gate struct {
 	baseSecure bool
 
 	sessionCookie string
+	csrfCookie    string
 }
 
 // New validates cfg, opens the store (failing if its directory is not
@@ -81,36 +83,55 @@ func New(ctx context.Context, cfg Config) (*Gate, error) {
 		public:        append([]string{"/healthz"}, cfg.PublicPaths...),
 		log:           log,
 		sessionCookie: name + "_session",
+		csrfCookie:    name + "_csrf",
 	}
 
-	o := cfg.OIDC
-	if o == nil {
-		return nil, errors.New("auth: OIDC is required (the gate has no login of its own)")
+	// The local account is on exactly when OIDC is off, unless said otherwise:
+	// an app with no configuration at all is still protected, and one with a
+	// provider delegates sign-in to it.
+	localOn := cfg.OIDC == nil
+	if cfg.LocalLogin != nil {
+		localOn = *cfg.LocalLogin
 	}
-	base, err := url.Parse(o.BaseURL)
-	if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
-		return nil, fmt.Errorf("auth: OIDC BaseURL %q must be an absolute http(s) URL", o.BaseURL)
+	if cfg.OIDC == nil && !localOn {
+		return nil, errors.New("auth: no way to sign in (configure OIDC or leave the local account enabled)")
 	}
-	if strings.Trim(base.Path, "/") != "" || base.RawQuery != "" || base.Fragment != "" {
-		return nil, fmt.Errorf("auth: OIDC BaseURL %q must not contain a path, query or fragment", o.BaseURL)
-	}
-	g.baseSecure = base.Scheme == "https"
-	redirect := strings.TrimRight(o.BaseURL, "/") + "/auth/callback"
 
-	m, err := oidc.New(ctx, (*gateShell)(g), oidc.Config{
-		Issuer:       o.Issuer,
-		ClientID:     o.ClientID,
-		ClientSecret: o.ClientSecret,
-		RedirectURL:  redirect,
-		Scopes:       o.Scopes,
-		RetryBase:    cfg.retryBase,
-	}, name+"_oidc_flow")
-	if err != nil {
-		return nil, err
-	}
-	g.methods = []shell.Method{m}
+	args := []any{"data_dir", dir, "local_login", localOn}
+	if o := cfg.OIDC; o != nil {
+		base, err := url.Parse(o.BaseURL)
+		if err != nil || (base.Scheme != "http" && base.Scheme != "https") || base.Host == "" {
+			return nil, fmt.Errorf("auth: OIDC BaseURL %q must be an absolute http(s) URL", o.BaseURL)
+		}
+		if strings.Trim(base.Path, "/") != "" || base.RawQuery != "" || base.Fragment != "" {
+			return nil, fmt.Errorf("auth: OIDC BaseURL %q must not contain a path, query or fragment", o.BaseURL)
+		}
+		g.baseSecure = base.Scheme == "https"
+		redirect := strings.TrimRight(o.BaseURL, "/") + "/auth/callback"
 
-	log.Info("auth: enabled", "issuer", o.Issuer, "redirect_uri", redirect, "data_dir", dir)
+		m, err := oidc.New(ctx, &gateShell{g: g, ns: "oidc"}, oidc.Config{
+			Issuer:       o.Issuer,
+			ClientID:     o.ClientID,
+			ClientSecret: o.ClientSecret,
+			RedirectURL:  redirect,
+			Scopes:       o.Scopes,
+			RetryBase:    cfg.retryBase,
+		}, name+"_oidc_flow")
+		if err != nil {
+			return nil, err
+		}
+		g.methods = append(g.methods, m)
+		args = append(args, "issuer", o.Issuer, "redirect_uri", redirect)
+	}
+	if localOn {
+		m, err := local.New(&gateShell{g: g, ns: "local"}, dir)
+		if err != nil {
+			return nil, fmt.Errorf("auth: opening the local account store: %w", err)
+		}
+		g.methods = append(g.methods, m)
+	}
+
+	log.Info("auth: enabled", args...)
 	return g, nil
 }
 

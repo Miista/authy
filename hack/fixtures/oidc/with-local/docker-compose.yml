@@ -1,0 +1,30 @@
+# OIDC with the local account stacked next to it (DEMO_LOCAL_ENABLED): the IdP
+# still owns the front door, but when it turns a login away (FAKEIDP_DENY) the
+# fallback page offers the local account as the escape hatch.
+services:
+  fakeidp:
+    image: authy-fakeidp:integration
+    pull_policy: never
+    ports:
+      - "127.0.0.1::8080"
+    environment:
+      ISSUER: "http://fakeidp:8080"
+      REDIRECT_URI: "http://subject:8080/auth/callback"
+      FAKEIDP_DENY: "true"
+
+  subject:
+    image: authy-subject:integration
+    pull_policy: never
+    user: "${RUN_AS}"
+    depends_on:
+      - fakeidp
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      DEMO_OIDC_ISSUER: "http://fakeidp:8080"
+      DEMO_OIDC_CLIENT_ID: "cid"
+      DEMO_OIDC_CLIENT_SECRET: "csecret"
+      DEMO_OIDC_BASE_URL: "http://subject:8080"
+      DEMO_LOCAL_ENABLED: "true"

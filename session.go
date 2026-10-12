@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -23,20 +24,8 @@ type sessionClaims struct {
 	U   *sessionUser `json:"u,omitempty"`
 }
 
-// flowClaims is the payload of the short-lived cookie carrying one OIDC login
-// attempt's state between /auth/oidc and /auth/callback.
-type flowClaims struct {
-	State    string `json:"state"`
-	Nonce    string `json:"nonce"`
-	Verifier string `json:"verifier"`
-	Next     string `json:"next"`
-	Exp      int64  `json:"exp"`
-}
-
 const (
 	purposeSession = "session"
-	purposeFlow    = "flow"
-	flowTTL        = 10 * time.Minute
 
 	// maxSessionFactor caps what sliding renewal can add up to: a session ends
 	// for good maxSessionFactor×TTL after sign-in, no matter how often it is
@@ -162,6 +151,30 @@ func (g *Gate) endSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	g.clearCookie(w, r, g.sessionCookie, "/")
+}
+
+// csrfToken returns the double-submit token for a method's form, setting its
+// cookie if the browser has none yet.
+func (g *Gate) csrfToken(w http.ResponseWriter, r *http.Request) string {
+	if ck, err := r.Cookie(g.csrfCookie); err == nil && len(ck.Value) == 43 {
+		return ck.Value
+	}
+	t := randString()
+	g.setCookie(w, r, g.csrfCookie, t, "/auth", 24*time.Hour)
+	return t
+}
+
+// checkCSRF accepts a POST only when it comes from this site (when the browser
+// says where it came from) and its form token matches the cookie's.
+func (g *Gate) checkCSRF(r *http.Request) bool {
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+		return false
+	}
+	ck, err := r.Cookie(g.csrfCookie)
+	if err != nil || ck.Value == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(ck.Value), []byte(r.PostFormValue("csrf"))) == 1
 }
 
 func randString() string {

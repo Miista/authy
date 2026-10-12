@@ -1,9 +1,10 @@
 # authy
 
-A drop-in OpenID Connect auth gate for any `net/http` Go app, configured by
-environment variables. Sign-in is your IdP's job (Authelia, Authentik,
-Keycloak, Entra ID, …); the gate is a relying party only, with no accounts,
-passwords or login form of its own.
+A drop-in auth gate for any `net/http` Go app, configured by environment
+variables. **Two lines and no configuration** → the app is protected by a
+local account the first visitor creates. **Add the `OIDC_*` variables** → the
+IdP (Authelia, Authentik, Keycloak, Entra ID, …) takes over sign-in, and the
+gate is a relying party.
 
 ```go
 gate, err := authy.FromEnv(ctx, "myapp") // reads MYAPP_* env vars
@@ -13,52 +14,63 @@ if err != nil {
 handler = gate.Wrap(handler) // no-op when the gate is off
 ```
 
-The gate owns all of authentication: the OIDC flow, sessions, sign-out and the
-routes under `/auth/`. The app has no code for any of it; remove the two lines
-and it has no idea any of it existed. Who may sign in is decided at the
-provider; the gate verifies the sign-in and records that the browser is
-authorized and who it is.
+The gate owns all of authentication: the sign-in methods, sessions, sign-out
+and the routes under `/auth/`. The app has no code for any of it; remove the
+two lines and it has no idea any of it existed. With OIDC configured, who may
+sign in is decided at the provider; the gate verifies the sign-in and records
+that the browser is authorized and who it is.
 
 It is **on by default**. An app that deliberately relies on something else
 (e.g. forward auth at a proxy) sets `MYAPP_AUTH_DISABLED=true`.
 
 ## How a visit is routed
 
+Methods are chosen by environment, defaulting to "always protected":
+
 ```mermaid
 flowchart TD
-    Start([Start]) --> Disc{Provider discovered?}
+    Start([Start]) --> First{First launch?}
 
-    Disc -- Yes --> IdP[Redirect to IdP]
-    Disc -- No --> Fallback[Fallback page: provider unreachable]
+    First -- Yes --> OIDC1{OIDC configured?}
+    First -- No  --> OIDC2{OIDC configured?}
+
+    OIDC1 -- Yes --> IdP[Redirect to IdP]
+    OIDC1 -- No  --> Setup[Create local login]
+    OIDC2 -- Yes --> IdP
+    OIDC2 -- No  --> LocalOn{Local login enabled?}
 
     IdP --> Approves{IdP approves login?}
     Approves -- Yes --> In([Logged in])
-    Approves -- No --> Fail[Fallback page: sign-in failed, retry button]
+    Approves -- No  --> LocalOn
 
-    Fallback --> Retry[Try again with OpenID Connect]
-    Fail --> Retry
-    Retry --> Disc
+    LocalOn -- Yes --> Form[Show login page]
+    LocalOn -- No  --> Err([Error])
 
-    classDef start fill:#2a5c36,stroke:#fff,color:#fff
-    classDef ok fill:#22385c,stroke:#fff,color:#fff
-    classDef bad fill:#5c2a2a,stroke:#fff,color:#fff
-    class Start start
-    class In ok
-    class Fail bad
+    Form --> In
+    Setup --> In
 ```
 
-- Page loads are redirected to the IdP; `fetch`/XHR and API clients get
-  `401 {"error":"unauthorized"}`.
-- `/auth/login` is the GET-only fallback page: a "Sign in with OpenID Connect"
-  button, and the error after a failed or unavailable attempt. It never has a
-  form and never redirects, so a rejection at the IdP cannot loop.
+- **No `OIDC_*` variables** → the local account is the method: the first
+  visitor creates the single account on `/auth/setup`, every later visit signs
+  in on `/auth/local`. No OIDC *and* `LOCAL_ENABLED=false` is a configuration
+  error: the gate refuses to start rather than serve unprotected.
+- **OIDC configured** → page loads go straight to the IdP, and **setup stays
+  closed**: nobody can claim the app by being first. `fetch`/XHR and API
+  clients get `401 {"error":"unauthorized"}`.
+- **When the IdP rejects (or is unreachable)**: with `<APP>_LOCAL_ENABLED=true`
+  the fallback page also offers the local account — the escape hatch; without
+  it, the page offers only a retry, never a loop.
+- `/auth/login` is the GET-only fallback page: one button per sign-in method,
+  and the error after a failed or unavailable attempt. It never redirects, so
+  a rejection at the IdP cannot loop.
 - An IdP that is unreachable at startup is not fatal. The gate retries in the
   background and the fallback page says "not reachable" meanwhile.
 
 ## Configuration
 
 `<APP>` is the name passed to `FromEnv`, upper-cased, non-alphanumerics → `_`.
-The four OIDC variables are **required** unless the gate is disabled.
+With no variables at all the gate runs on the local account; the four OIDC
+variables are **required together**.
 
 | Variable | |
 |---|---|
@@ -67,6 +79,7 @@ The four OIDC variables are **required** unless the gate is disabled.
 | `<APP>_OIDC_ISSUER` | IdP issuer URL, e.g. `https://auth.example.com`. |
 | `<APP>_OIDC_CLIENT_ID`, `_CLIENT_SECRET` | The client registered at the IdP. |
 | `<APP>_OIDC_BASE_URL` | The app's external URL, no path: `https://myapp.example.com`. |
+| `<APP>_LOCAL_ENABLED` | Overrides the default (local account on exactly when OIDC is off): `true` keeps it next to OIDC as an escape hatch; `false` without OIDC is an error. |
 
 Missing settings or a malformed boolean make `FromEnv` return an error.
 
@@ -91,7 +104,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 ```
 
 `User` has `Subject` (the IdP's stable `sub`), `Name` (for display, not an
-identifier), `Email` and `Groups`.
+identifier), `Email` and `Groups`. The local account yields
+`Subject: "local:<username>"`, `Name: <username>` and no groups; the `local:`
+namespace is reserved for it, so no IdP subject can collide with it.
 
 - `WithScopes` is an option, not an environment variable: which scopes an app
   needs belongs to its code, not to a deployment. `openid` is always requested.
@@ -116,7 +131,9 @@ identifier), `Email` and `Groups`.
 ## State
 
 `/app/data/auth/auth.json` (directory `0700`, file `0600`): the key that signs
-session cookies, and the revoked session IDs from sign-outs. It lives in the
+session cookies, and the revoked session IDs from sign-outs. With the local
+account enabled, `local.json` (also `0600`) sits next to it and holds the single
+username and its bcrypt hash — never a plaintext password. Both live in the
 app's existing `/app/data` volume, must be writable by the app's user (startup
 fails with a clear message if not), and can't be moved. Sessions are signed
 `HttpOnly`, `SameSite=Lax` cookies (`Secure` over HTTPS or
@@ -146,43 +163,12 @@ the gate off it is a 404, the attribute never appears, and everything marked
 
 ## Apps that want a local account
 
-`authy` is OIDC enablement and nothing else: no accounts, no passwords, no
-login form. An app that also wants a local account (say, a break-glass login for
-when the IdP is down) builds that itself, with its own pages and its own
-session. It doesn't need anything from the gate, because `Wrap` is ordinary
-middleware and the app can put its own check in front of it:
-
-```go
-guarded := gate.Wrap(mux)
-handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-	switch {
-	case strings.HasPrefix(r.URL.Path, "/auth/"):
-		guarded.ServeHTTP(w, r) // the gate's routes, including the OIDC callback
-	case local.OwnsPath(r.URL.Path): // the app's own login page and POST
-		mux.ServeHTTP(w, r)
-	case local.LoggedIn(r): // the app's own session is valid: skip the gate
-		mux.ServeHTTP(w, r)
-	default:
-		guarded.ServeHTTP(w, r) // everyone else signs in with OIDC
-	}
-})
-```
-
-What to know before doing this:
-
-- **The app's check is authoritative** for the requests it lets through: a bug
-  in it is a bypass of everything, the gate included. Keep it small and test it.
-- **Use a different session cookie name** from the gate's (`<app>_session`).
-- **Sign out is the app's job** for a locally signed-in user: the gate's
-  `/auth/logout` clears only the gate's cookie. Clear the app's session first,
-  then send the browser to `/auth/logout`.
-- **`UserFrom` is empty** for requests that skip the gate; take identity from
-  the app's own session on those.
-- **The local login is not advertised.** An unauthenticated page load goes
-  straight to the IdP, and the fallback page has no link to the app's own login,
-  so users need its URL (or the app links to it from somewhere else).
-- If the gate is off (`<APP>_AUTH_DISABLED=true`), `gate` is nil and `Wrap` is a
-  no-op; the same composition still works.
+Set `<APP>_LOCAL_ENABLED=true` (or `authy.WithLocalLogin(true)`). The gate does
+this properly itself: the account is just another sign-in method behind the
+same session, sign-out and identity, so there is nothing to compose by hand.
+Next to OIDC it is the break-glass login for when the IdP is down or says no;
+note that setup stays open until the account exists, so create it right after
+enabling.
 
 ## Security
 
@@ -191,6 +177,15 @@ OIDC with PKCE, `state`, `nonce` and full ID-token verification via
 requests (`Sec-Fetch-Site`); `?next=` accepted only as a local path and
 every redirect re-checked; static gate pages with a strict CSP and `no-store`.
 Tokens and secrets are never logged.
+
+The local account: a single account, password hashed with bcrypt (cost 12,
+passwords capped at 72 bytes because bcrypt ignores the rest); a process-wide
+rate limiter (5 failures → `429` with `Retry-After` for a minute); double-submit
+CSRF tokens plus `Sec-Fetch-Site` on the setup and login forms; setup closed
+for good once the account exists when OIDC is configured. Methods only
+authenticate — **only the shell mints sessions**, and it enforces the `local:`
+subject namespace in both directions, so an IdP token whose `sub` is literally
+`local:admin` can never collide with the local account.
 
 This is security-critical code. It is tested (`-race`) and scanned (`gosec`,
 `govulncheck`) but has had no independent review.

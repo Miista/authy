@@ -3,6 +3,8 @@ package authy
 import (
 	"html/template"
 	"net/http"
+
+	"github.com/miista/authy/internal/shell"
 )
 
 // clientJS is what /auth/client.js serves. An app that wants a "Sign out"
@@ -21,8 +23,9 @@ type pageData struct {
 	Heading   string
 	Error     string
 	Message   string
-	Entries   []pageEntry // one button per sign-in method
-	Link      string      // optional trailing link, e.g. "Sign in again"
+	Entries   []pageEntry     // one button per sign-in method
+	Form      *shell.FormPage // a method's own form (the local account)
+	Link      string          // optional trailing link, e.g. "Sign in again"
 	LinkLabel string
 }
 
@@ -45,14 +48,17 @@ main{width:100%;max-width:360px}
 h1{font-size:20px;margin:0 0 4px}
 .app{margin:0 0 20px;color:#9a9db0;font-size:14px}
 p{margin:0 0 14px}
-.btn:focus-visible{outline:2px solid #8a7cff;outline-offset:2px}
-.btn{display:block;width:100%;margin-top:18px;padding:11px 14px;border-radius:10px;border:1px solid #33364a;
+label{display:block;font-size:13px;color:#9a9db0;margin:12px 0 4px}
+input{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #33364a;background:#1b1d27;color:inherit;font:inherit}
+input:focus-visible,button:focus-visible,.btn:focus-visible{outline:2px solid #8a7cff;outline-offset:2px}
+button,.btn{display:block;width:100%;margin-top:18px;padding:11px 14px;border-radius:10px;border:1px solid #33364a;
 background:#6f5cf0;color:#fff;font:inherit;font-weight:600;text-align:center;text-decoration:none;cursor:pointer}
 .err{padding:10px 12px;border-radius:10px;background:#3a1d22;border:1px solid #6b2d36;color:#ffb4bd}
 a{color:#a99cff}
 @media (prefers-color-scheme:light){
 body{background:#f4f5f9;color:#1b1d27}
-.app{color:#5b5f73}
+input{background:#fff;color:#1b1d27;border-color:#c9ccdb}
+label,.app{color:#5b5f73}
 .err{background:#fde8ea;border-color:#f3b3ba;color:#8a1f2d}a{color:#4b3bd6}}
 </style></head>
 <body><main>
@@ -60,6 +66,17 @@ body{background:#f4f5f9;color:#1b1d27}
 <p class="app">{{.App}}</p>
 {{if .Error}}<p class="err" role="alert">{{.Error}}</p>{{end}}
 {{if .Message}}<p>{{.Message}}</p>{{end}}
+{{with .Form}}
+<form method="post" action="{{.Action}}">
+<input type="hidden" name="csrf" value="{{.CSRF}}">
+<input type="hidden" name="next" value="{{.Next}}">
+{{range .Fields}}
+<label for="{{.ID}}">{{.Label}}</label>
+<input id="{{.ID}}" name="{{.Name}}" type="{{.Type}}" autocomplete="{{.Autocomplete}}" required{{if .MinLen}} minlength="{{.MinLen}}"{{end}}{{if .MaxLen}} maxlength="{{.MaxLen}}"{{end}}{{if .Autofocus}} autofocus{{end}}>
+{{end}}
+<button type="submit">{{.Submit}}</button>
+</form>
+{{end}}
 {{range .Entries}}
 <a class="btn" href="{{.URL}}">{{.Label}}</a>
 {{end}}
@@ -77,7 +94,7 @@ func (g *Gate) render(w http.ResponseWriter, status int, d pageData) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("Referrer-Policy", "same-origin")
-	h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'")
+	h.Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 	w.WriteHeader(status)
 	if err := pageTmpl.Execute(w, d); err != nil {
 		g.log.Error("auth: rendering page", "err", err)

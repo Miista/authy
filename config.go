@@ -21,10 +21,17 @@ type Config struct {
 	// apps on one host (different ports) never read each other's sessions.
 	App string
 
-	// OIDC is the OpenID Connect provider that owns sign-in. It is required:
-	// the gate is a relying party only and has no login of its own, so who may
-	// sign in, and how, is entirely the provider's business.
+	// OIDC is the OpenID Connect provider. When set, sign-in is the provider's:
+	// who may sign in, and how, is its business, and the gate redirects to it.
+	// When nil, the local account is the way in.
 	OIDC *OIDCConfig
+
+	// LocalLogin turns the local account on or off. Nil means the default:
+	// enabled exactly when OIDC is not configured, so an app is protected with
+	// no configuration at all. Setting it true next to OIDC adds the account
+	// as an escape hatch (and opens setup until it exists); setting it false
+	// without OIDC is an error, because the app would have no way in.
+	LocalLogin *bool
 
 	// DataDir holds auth.json (the session-signing key and sign-out records).
 	// Default /app/data/auth.
@@ -83,6 +90,9 @@ func WithScopes(scopes ...string) Option {
 	}
 }
 
+// WithLocalLogin overrides the local-account default (see Config.LocalLogin).
+func WithLocalLogin(on bool) Option { return func(c *Config) { c.LocalLogin = &on } }
+
 // WithLogger sets the logger. Default: slog.Default().
 func WithLogger(l *slog.Logger) Option { return func(c *Config) { c.Logger = l } }
 
@@ -92,16 +102,20 @@ func WithDataDir(dir string) Option { return func(c *Config) { c.DataDir = dir }
 // FromEnv builds a Gate for an app from <APP>_* environment variables, where
 // <APP> is app upper-cased with non-alphanumerics replaced by "_".
 //
-// The gate is ON by default and sign-in is the OIDC provider's, so the four
-// OIDC variables are required unless the gate is disabled:
+// The gate is ON by default: with no variables at all, the first visitor
+// creates the local account and every later visit needs it. The OIDC
+// variables hand sign-in to a provider instead:
 //
 //	<APP>_AUTH_DISABLED     true: no gate at all, FromEnv returns nil
 //	                        (for apps deliberately behind forward auth)
 //	<APP>_AUTH_PUBLIC_PATHS comma-separated paths that skip auth, added to /healthz
 //	<APP>_OIDC_ISSUER       the provider, e.g. https://auth.example.com
-//	<APP>_OIDC_CLIENT_ID
+//	<APP>_OIDC_CLIENT_ID    all four are required together
 //	<APP>_OIDC_CLIENT_SECRET
 //	<APP>_OIDC_BASE_URL     this app's external URL
+//	<APP>_LOCAL_ENABLED     overrides the default (local on exactly when OIDC
+//	                        is off): true keeps the local account next to OIDC
+//	                        as an escape hatch; false without OIDC is an error
 //
 // (*Gate)(nil).Wrap is a no-op, so the same two lines work with the gate on
 // or off. Malformed or incomplete settings are an error: the caller should
@@ -136,10 +150,22 @@ func FromEnv(ctx context.Context, app string, opts ...Option) (*Gate, error) {
 			missing = append(missing, p+"OIDC_"+v.name)
 		}
 	}
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("auth: missing %s (or set %sAUTH_DISABLED=true)", strings.Join(missing, ", "), p)
+	switch {
+	case len(missing) == 4:
+		// No OIDC at all: the local account is the way in.
+	case len(missing) > 0:
+		return nil, fmt.Errorf("auth: missing %s (all four OIDC settings are required together)", strings.Join(missing, ", "))
+	default:
+		cfg.OIDC = o
 	}
-	cfg.OIDC = o
+
+	if raw := strings.TrimSpace(os.Getenv(p + "LOCAL_ENABLED")); raw != "" {
+		on, err := envBool(p + "LOCAL_ENABLED")
+		if err != nil {
+			return nil, err
+		}
+		cfg.LocalLogin = &on
+	}
 
 	for _, path := range strings.Split(os.Getenv(p+"AUTH_PUBLIC_PATHS"), ",") {
 		if path = strings.TrimSpace(path); path != "" {

@@ -40,6 +40,33 @@ type Method interface {
 	Ready() bool
 }
 
+// FormPage is a gate-styled page with one POST form, for a method that signs
+// people in with a form of its own (the local account). The shell renders it,
+// so every method's pages share one look and one set of response headers.
+type FormPage struct {
+	Title   string
+	Heading string
+	Error   string
+	Message string
+	Action  string // the POST target, one of the method's own routes
+	Submit  string // the button's label
+	Next    string // carried through the form, already SafeNext-ed by the caller
+	CSRF    string // from CSRFToken; the shell adds the hidden fields
+	Fields  []Field
+}
+
+// Field is one input on a FormPage.
+type Field struct {
+	ID           string
+	Name         string
+	Label        string
+	Type         string // "text" or "password"
+	Autocomplete string
+	MinLen       int
+	MaxLen       int
+	Autofocus    bool
+}
+
 // Shell is what the pipeline offers a method. It is implemented by the gate.
 type Shell interface {
 	// SignIn mints the session for an authenticated identity and redirects to
@@ -57,4 +84,12 @@ type Shell interface {
 	// SafeNext keeps only same-site absolute paths outside /auth/.
 	SafeNext(next string) string
 	Log() *slog.Logger
+
+	// RenderForm shows a method's form page in the gate's shared style.
+	RenderForm(w http.ResponseWriter, status int, p FormPage)
+	// CSRFToken returns the double-submit token for a method's form, setting
+	// its cookie if the browser has none yet; CheckCSRF verifies a POST
+	// against it (and against Sec-Fetch-Site).
+	CSRFToken(w http.ResponseWriter, r *http.Request) string
+	CheckCSRF(r *http.Request) bool
 }

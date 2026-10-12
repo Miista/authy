@@ -1,0 +1,13 @@
+# No OIDC configuration at all: the gate is still on, and the local account
+# is the way in. The first visitor creates the single account on /auth/setup;
+# the account (local.json) and the session key (auth.json) live in the data
+# volume, so both survive a container restart.
+services:
+  subject:
+    image: authy-subject:integration
+    pull_policy: never
+    user: "${RUN_AS}"
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - ./data:/app/data
