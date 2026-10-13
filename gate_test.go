@@ -947,3 +947,19 @@ func TestLoggedOutPage(t *testing.T) {
 		t.Errorf("%d %.100s", res.StatusCode, body)
 	}
 }
+
+func TestOIDCReportsHowSignInHappens(t *testing.T) {
+	if (*Gate)(nil).OIDC() {
+		t.Fatal("a nil gate (no login) must not report OIDC")
+	}
+	local, err := New(context.Background(), Config{App: "my-app", DataDir: t.TempDir(), Logger: quiet})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local.OIDC() {
+		t.Fatal("a local-account gate must not report OIDC")
+	}
+	if !startOtherKey(t).OIDC() {
+		t.Fatal("a gate with a provider must report OIDC")
+	}
+}

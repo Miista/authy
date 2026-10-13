@@ -47,6 +47,7 @@ type Gate struct {
 	log        *slog.Logger
 	methods    []shell.Method
 	baseSecure bool
+	oidc       bool // sign-in is delegated to an identity provider
 
 	sessionCookie string
 	csrfCookie    string
@@ -121,6 +122,7 @@ func New(ctx context.Context, cfg Config) (*Gate, error) {
 			return nil, err
 		}
 		g.methods = append(g.methods, m)
+		g.oidc = true
 		args = append(args, "issuer", o.Issuer, "redirect_uri", redirect)
 	}
 	if localOn {
@@ -134,6 +136,11 @@ func New(ctx context.Context, cfg Config) (*Gate, error) {
 	log.Info("auth: enabled", args...)
 	return g, nil
 }
+
+// OIDC reports whether sign-in is delegated to an identity provider, so an
+// app can tell whether provider data such as groups is there to be read. It
+// is false on a nil Gate (no login at all).
+func (g *Gate) OIDC() bool { return g != nil && g.oidc }
 
 // Wrap returns next guarded by the gate. On a nil Gate it returns next
 // unchanged.
