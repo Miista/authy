@@ -400,7 +400,7 @@ func TestSessionsEndAtTheAbsoluteCap(t *testing.T) {
 	// A session created maxSessionFactor×TTL ago is dead even with a fresh Exp,
 	// so sliding renewal cannot keep one sign-in alive forever.
 	old := time.Now().Add(-time.Duration(maxSessionFactor)*g.ttl - time.Hour)
-	claims := sessionClaims{Exp: time.Now().Add(g.ttl).Unix(), Iat: old.Unix(), SID: randString(), U: newSessionUser("user-1", "alice", "", nil)}
+	claims := sessionClaims{Exp: time.Now().Add(g.ttl).Unix(), Iat: old.Unix(), SID: randString(), U: newSessionUser("user-1", "alice", "", "", nil)}
 	appURL, _ := url.Parse(app.URL)
 	c.Jar.SetCookies(appURL, []*http.Cookie{{Name: g.sessionCookie, Value: g.seal(purposeSession, claims)}})
 	if res, _ := get(t, c, app.URL+"/api", nil); res.StatusCode != 401 {

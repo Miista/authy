@@ -293,11 +293,7 @@ func (m *Method) identity(ctx context.Context, s *providerState, tok *oauth2.Tok
 		c.Groups = fromInfo.Groups
 	}
 
-	name := c.PreferredUsername
-	if name == "" {
-		name = c.Name
-	}
-	return shell.Identity{Subject: idToken.Subject, Name: name, Email: c.Email, Groups: c.Groups}, nil
+	return shell.Identity{Subject: idToken.Subject, Username: c.PreferredUsername, DisplayName: c.Name, Email: c.Email, Groups: c.Groups}, nil
 }
 
 // scopesOrDefault is what is asked of the provider: the configured scopes, or

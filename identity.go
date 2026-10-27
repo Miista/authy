@@ -15,9 +15,18 @@ import (
 type User struct {
 	// Subject is the provider's stable ID for the person (the "sub" claim).
 	Subject string
+	// Username is the provider's short login handle (the "preferred_username"
+	// claim), or empty if it gave none. It suits logs and admin views; it is not
+	// an identifier, so key anything that must stay put by Subject.
+	Username string
+	// DisplayName is what to show a person: their name (the "name" claim) if the
+	// provider gave one, else their username, else their email, else the subject.
+	DisplayName string
 	// Name is the person's username if the provider gave one, else their name,
-	// else their email, else the subject. It is for display and logs; it is not
-	// an identifier, and two people can share one.
+	// else their email, else the subject.
+	//
+	// Deprecated: use DisplayName to show a person and Username for logs. Name
+	// stays as it always was so existing apps keep working.
 	Name  string
 	Email string
 	// Groups is the "groups" claim, which the provider only sends when the app
@@ -67,26 +76,36 @@ type sessionUser struct {
 	Name   string   `json:"n,omitempty"`
 	Email  string   `json:"e,omitempty"`
 	Groups []string `json:"g,omitempty"`
+	// Username and Display are newer than the rest: a session minted before
+	// they existed has neither, and user() falls back to Name for the display.
+	Username string `json:"u,omitempty"`
+	Display  string `json:"d,omitempty"`
 }
 
 func (s *sessionUser) user() User {
-	return User{Subject: s.Sub, Name: s.Name, Email: s.Email, Groups: s.Groups}
+	display := s.Display
+	if display == "" {
+		display = s.Name
+	}
+	return User{Subject: s.Sub, Username: s.Username, DisplayName: display, Name: s.Name, Email: s.Email, Groups: s.Groups}
 }
 
 // newSessionUser cleans what a provider sent. An empty subject yields nil: an
 // identity with no stable ID would let two people be mistaken for one.
-func newSessionUser(sub, name, email string, groups []string) *sessionUser {
+func newSessionUser(sub, username, displayName, email string, groups []string) *sessionUser {
 	sub = clean(sub, maxSubjectLen)
 	if sub == "" {
 		return nil
 	}
-	u := &sessionUser{Sub: sub, Name: clean(name, maxNameLen), Email: clean(email, maxEmailLen)}
-	if u.Name == "" {
-		u.Name = u.Email
+	u := &sessionUser{
+		Sub:      sub,
+		Username: clean(username, maxNameLen),
+		Display:  clean(displayName, maxNameLen),
+		Email:    clean(email, maxEmailLen),
 	}
-	if u.Name == "" {
-		u.Name = clean(sub, maxNameLen)
-	}
+	// Name is what the provider's username-then-name preference always gave.
+	u.Name = firstOf(maxNameLen, u.Username, u.Display, u.Email, sub)
+	u.Display = firstOf(maxNameLen, u.Display, u.Username, u.Email, sub)
 	seen := map[string]bool{}
 	for _, g := range groups {
 		g = clean(g, maxGroupLen)
@@ -97,6 +116,16 @@ func newSessionUser(sub, name, email string, groups []string) *sessionUser {
 		u.Groups = append(u.Groups, g)
 	}
 	return u
+}
+
+// firstOf is the first of the candidates that survives cleaning.
+func firstOf(max int, candidates ...string) string {
+	for _, c := range candidates {
+		if c = clean(c, max); c != "" {
+			return c
+		}
+	}
+	return ""
 }
 
 // clean trims, drops control characters, and cuts to max bytes on a rune boundary.

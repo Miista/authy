@@ -189,7 +189,7 @@ func (m *Method) postSetup(w http.ResponseWriter, r *http.Request) {
 
 func (m *Method) signIn(w http.ResponseWriter, r *http.Request, username, next string) {
 	username = strings.TrimSpace(username)
-	id := shell.Identity{Subject: "local:" + username, Name: username}
+	id := shell.Identity{Subject: "local:" + username, Username: username, DisplayName: username}
 	if err := m.sh.SignIn(w, r, id, next); err != nil {
 		m.sh.Fail(w, r, "failed", next, err.Error())
 		return

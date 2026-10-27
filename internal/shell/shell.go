@@ -16,9 +16,12 @@ import (
 // control characters) before it enters a session; a method hands it over raw.
 type Identity struct {
 	Subject string
-	Name    string
-	Email   string
-	Groups  []string
+	// Username is the login handle and DisplayName the person's name; either
+	// may be empty, and the shell fills in what is missing.
+	Username    string
+	DisplayName string
+	Email       string
+	Groups      []string
 }
 
 // Entry is a method's line on the sign-in page: where its ceremony starts.

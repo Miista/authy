@@ -31,7 +31,7 @@ type gateShell struct {
 // would let two people be mistaken for one. The local namespace is enforced in
 // both directions: only the local method may use it, and it must.
 func (s *gateShell) SignIn(w http.ResponseWriter, r *http.Request, id shell.Identity, next string) error {
-	u := newSessionUser(id.Subject, id.Name, id.Email, id.Groups)
+	u := newSessionUser(id.Subject, id.Username, id.DisplayName, id.Email, id.Groups)
 	if u == nil {
 		return errors.New("the identity has no usable subject")
 	}

@@ -13,10 +13,12 @@ import (
 type who struct {
 	OK   bool `json:"ok"`
 	User struct {
-		Subject string
-		Name    string
-		Email   string
-		Groups  []string
+		Subject     string
+		Username    string
+		DisplayName string
+		Name        string
+		Email       string
+		Groups      []string
 	} `json:"user"`
 }
 
@@ -73,6 +75,10 @@ func TestOIDCGroupsOnlyInUserInfoAreFetched(t *testing.T) {
 	w, code := whoami(t, signInOIDC(t, app), app)
 	if code != 200 || !w.OK || w.User.Name != "alice" || strings.Join(w.User.Groups, ",") != "media-editors,users" {
 		t.Errorf("%d %+v", code, w)
+	}
+	// The handle and the person's name arrive separately; Name keeps the handle.
+	if w.User.Username != "alice" || w.User.DisplayName != "Alice" {
+		t.Errorf("Username = %q, DisplayName = %q", w.User.Username, w.User.DisplayName)
 	}
 	if idp.userinfoHits != 1 {
 		t.Errorf("UserInfo hits = %d, want 1", idp.userinfoHits)
@@ -175,7 +181,7 @@ func TestIdentitySurvivesTheSlidingRefresh(t *testing.T) {
 	idp := newFakeIdP(t)
 	idp.Start()
 	app, g := startApp(t, Config{SessionTTL: time.Hour, OIDC: oidcCfg(idp)})
-	su := newSessionUser("user-1", "alice", "a@example.com", []string{"admins"})
+	su := newSessionUser("user-1", "alice", "Alice A", "a@example.com", []string{"admins"})
 	old := g.seal(purposeSession, sessionClaims{Exp: time.Now().Add(10 * time.Minute).Unix(), U: su}) // under half left
 	u, _ := url.Parse(app.URL)
 	c := browser()
@@ -233,7 +239,7 @@ func TestEntriesAreCleanedBeforeTheyGoIntoACookie(t *testing.T) {
 		many = append(many, "group-"+strings.Repeat("x", i%5)+string(rune('a'+i%26))+strings.Repeat("y", i))
 	}
 	long := strings.Repeat("z", maxGroupLen+1)
-	u := newSessionUser("user-1", "  ali\nce\t ", "a@example.com", append([]string{"admins", "admins", "", long, "ad\x00mins2"}, many...))
+	u := newSessionUser("user-1", "  ali\nce\t ", "", "a@example.com", append([]string{"admins", "admins", "", long, "ad\x00mins2"}, many...))
 	if u.Name != "alice" {
 		t.Errorf("name = %q", u.Name)
 	}
@@ -257,11 +263,38 @@ func TestEntriesAreCleanedBeforeTheyGoIntoACookie(t *testing.T) {
 }
 
 func TestAnIdentityWithoutASubjectIsRefused(t *testing.T) {
-	if newSessionUser("", "x", "a@b", nil) != nil || newSessionUser("  \n", "x", "", nil) != nil {
+	if newSessionUser("", "x", "", "a@b", nil) != nil || newSessionUser("  \n", "x", "", "", nil) != nil {
 		t.Error("two people with no stable ID could be mistaken for one")
 	}
-	if newSessionUser("s", "", "", nil).Name != "s" {
-		t.Error("the name should fall back to the subject")
+	if u := newSessionUser("s", "", "", "", nil); u.Name != "s" || u.Display != "s" || u.Username != "" {
+		t.Errorf("the names should fall back to the subject, and the username stay empty: %+v", u)
+	}
+}
+
+// Name is deprecated but must keep returning what it always did: the username,
+// else the name, else the email, else the subject. DisplayName prefers the name.
+func TestTheThreeNamesFallBackAsDocumented(t *testing.T) {
+	for _, c := range []struct {
+		username, display, email string
+		name, displayName        string
+	}{
+		{"soren", "Søren", "s@x", "soren", "Søren"},
+		{"soren", "", "s@x", "soren", "soren"},
+		{"", "Søren", "s@x", "Søren", "Søren"},
+		{"", "", "s@x", "s@x", "s@x"},
+		{"", "", "", "sub-1", "sub-1"},
+	} {
+		u := newSessionUser("sub-1", c.username, c.display, c.email, nil).user()
+		if u.Name != c.name || u.DisplayName != c.displayName || u.Username != c.username {
+			t.Errorf("%+v: got Name=%q DisplayName=%q Username=%q", c, u.Name, u.DisplayName, u.Username)
+		}
+	}
+}
+
+func TestASessionCookieFromBeforeTheNewNamesStillHasADisplayName(t *testing.T) {
+	u := (&sessionUser{Sub: "s", Name: "alice"}).user()
+	if u.DisplayName != "alice" || u.Name != "alice" || u.Username != "" {
+		t.Errorf("%+v", u)
 	}
 }
 
